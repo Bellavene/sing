@@ -14,6 +14,9 @@ A TUI panel for [Sing-Box](https://github.com/SagerNet/sing-box)’s API calls u
 Seperate versions for sing-box running on a server (sing) or local client machine (singlo)
 
 #### Sing
+
+for sing-box running on a server machine
+
 <img width="1650" height="752" alt="Screenshot 2026-09-26 at 02 37 33 2" src="https://github.com/user-attachments/assets/a062d5d1-9325-4394-b30e-4a707cfba220" />
 
 - <b>Enter</b>  Shows a popup with queried information about selected connection
@@ -28,6 +31,8 @@ Seperate versions for sing-box running on a server (sing) or local client machin
 - <b>S</b>  Changes sort order
 
 #### Singlo
+
+For clients local sing-box instance
 
 <img width="876" height="386" alt="Screenshot 2026-09-26 at 05 40 15" src="https://github.com/user-attachments/assets/b20dbcd2-ec7d-409d-b920-6300f0bb45d9" />
 
