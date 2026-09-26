@@ -32,5 +32,5 @@ A TUI panel to directly talk to [Sing-Box](https://github.com/SagerNet/sing-box)
 - <b>S</b>  Changes sort order
 
 # Information
-All settings can be set directly in the Python code.
+All settings, API address and keys can be set directly in the Python code.
 Uses Hack Nerd Font for icons.
