@@ -7,7 +7,7 @@ A TUI panel for [Sing-Box](https://github.com/SagerNet/sing-box)’s API calls u
 #### Features
 
   1. Visually pleasant minimal design.
-  2. Highlights problematic connections and destination IP’s by specific country code.
+  2. Highlights problematic connections.
   3. AbuseIPDB API integration to instantly fetch and cache additional information about all outbound and inbound IP’s
   4. A simple catching system for destination IP’s based on cached AbuseIPDB queries by country code.
 
