@@ -1,0 +1,1147 @@
+#!/usr/bin/env python3
+import curses
+import json
+import os
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from cachetools import LRUCache
+
+# Reduce curses escape key delay from default (1000ms) to 25ms for instant response
+os.environ["ESCDELAY"] = "25"
+
+try:
+    import websocket
+except ImportError:
+    print("Missing required dependency: 'websocket-client'. Attempting automatic installation...")
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "websocket-client"])
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "cachetools"])
+        import websocket
+        print("Successfully installed 'websocket-client'. Starting script...")
+    except Exception as e:
+        print(f"Error: Failed to automatically install 'websocket-client' ({e}).")
+        print("Please install it manually using: pip install websocket-client")
+        sys.exit(1)
+
+# Global Config / Defaults
+SINGBOX_API = os.environ.get(
+    "SINGBOX_API",
+    "http://SINGBOX_ADDRESS:PORT")
+SINGBOX_SECRET = os.environ.get(
+    "SINGBOX_SECRET",
+    "someSECRET")
+ABUSEIPDB_API_KEY = os.environ.get(
+    "ABUSEIPDB_API_KEY",
+    "someSECRET",
+)
+CACHE_DIR = os.path.expanduser("~/.cache/sing-box-API")
+TAB_NAME = os.environ.get("SINGBOX_TAB_NAME", "<b>A1</b>")  # Terminal Tab / Window Name
+CACHE_TTL_SECONDS = 14 * 86400  # 2 Weeks in seconds
+
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+# Color pair configuration (indices)
+CP_DEFAULT = 0
+CP_ERROR = 1
+CP_GREEN = 2
+CP_MAGENTA = 3
+CP_GEO = 4
+CP_YELLOW = 5
+CP_SEL = 6
+CP_SEL_DEAD = 7
+CP_CLOSED = 9
+
+# State Variables
+SORT_BY = "end"  # "start", "end", "upload", "download"
+FILTER_QUERY = ""
+GEO_COUNTRY_CODE = "RU"
+CHECK_GEO_IPS = True
+IS_PAUSED = False
+ABUSE_STATUS_MSG = ""
+SELECTED_ROW = 0
+SELECTED_CONN_ID = None  # Unique connection tracker
+SCROLL_OFFSET = 0  # Offscreen scrolling line tracking
+AUTO_FOLLOW_MODE = "top"  # "top", "bottom", or "none"
+ABUSEIPDB_ENABLED = True  # Flag to enable/disable AbuseIPDB queries
+
+# GEO View State & Cache
+IN_GEO_VIEW = False
+GEO_CONNECTIONS_CACHE = {}  # cid -> connection dict
+GEO_SELECTED_ROW = 0
+GEO_SCROLL_OFFSET = 0
+
+# Modal state
+MODAL_DATA = None
+MODAL_LOCK = threading.Lock()
+MODAL_WIN = None
+
+# In-Memory Cache (Limited to 100 entries)
+ABUSE_CACHE = LRUCache(maxsize=100)
+
+# Thread Pool for AbuseIPDB fetches (max 5 workers)
+thread_pool = ThreadPoolExecutor(max_workers=5)
+
+CONNECTION_HISTORY = {}
+CONNECTIONS_LOCK = threading.Lock()
+LATEST_CONNECTIONS = []
+API_ERROR = None
+
+# --- IP Helper ---
+def is_valid_ip(target):
+    if not target or target in ["-", "127.0.0.1", "::1"]:
+        return False
+    try:
+        socket.inet_aton(target)
+        return True
+    except socket.error:
+        try:
+            socket.inet_pton(socket.AF_INET6, target)
+            return True
+        except socket.error:
+            return False
+
+# --- Terminal Tab Title Helper ---
+def set_terminal_title(title):
+    if title:
+        sys.stdout.write(f"\033]0;{title}\007")
+        sys.stdout.flush()
+
+# --- Clipboard Helpers ---
+def get_clipboard_cmd():
+    for cmd in ["pbcopy", "xclip -selection clipboard", "xsel --clipboard --input", "wl-copy"]:
+        binary = cmd.split()[0]
+        if subprocess.call(f"command -v {binary} >/dev/null 2>&1", shell=True) == 0:
+            return cmd
+    return None
+
+CLIPBOARD_CMD = get_clipboard_cmd()
+
+def copy_to_clipboard(text):
+    if not CLIPBOARD_CMD or not text:
+        return False
+    try:
+        proc = subprocess.Popen(CLIPBOARD_CMD, shell=True, stdin=subprocess.PIPE)
+        proc.communicate(input=text.encode("utf-8"))
+        return True
+    except Exception:
+        return False
+
+# --- REST API Operations ---
+def api_request(path, method="GET"):
+    url = f"{SINGBOX_API}/{path.lstrip('/')}"
+    headers = {}
+    if SINGBOX_SECRET:
+        headers["Authorization"] = f"Bearer {SINGBOX_SECRET}"
+
+    req = urllib.request.Request(url, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            if resp.status == 200:
+                body = resp.read().decode("utf-8")
+                return json.loads(body) if body else {}
+            elif resp.status == 204:
+                return True
+    except Exception:
+        return None
+    return None
+
+# --- Cache & AbuseIPDB Handling (14-Day Expiration) ---
+def fetch_abuse_data(target):
+    global ABUSEIPDB_ENABLED
+
+    if not ABUSEIPDB_ENABLED:
+        return {"ip": target or "-", "error": "AbuseIPDB Disabled"}
+
+    if not target or target in ["-", "127.0.0.1", "::1"]:
+        return {"ip": target or "-", "error": "Invalid / Local Target"}
+
+    query_ip = target
+    query_host = None
+    if not is_valid_ip(target):
+        try:
+            query_ip = socket.gethostbyname(target)
+            query_host = target
+        except Exception:
+            query_host = target
+
+    cache_key = query_ip if is_valid_ip(query_ip) else query_host
+    cache_file = os.path.join(CACHE_DIR, f"{cache_key}.json")
+    now = time.time()
+
+    if cache_key in ABUSE_CACHE:
+        if os.path.exists(cache_file):
+            file_mtime = os.path.getmtime(cache_file)
+            if now - file_mtime < CACHE_TTL_SECONDS:
+                return ABUSE_CACHE[cache_key]
+
+    if os.path.exists(cache_file):
+        try:
+            file_mtime = os.path.getmtime(cache_file)
+            if now - file_mtime < CACHE_TTL_SECONDS:
+                with open(cache_file, "r") as f:
+                    data = json.load(f)
+                    ABUSE_CACHE[cache_key] = data
+                    return data
+        except Exception:
+            pass
+
+    if not ABUSEIPDB_API_KEY:
+        return {"ip": cache_key, "error": "API Key Not Set"}
+
+    try:
+        query_target = query_ip if is_valid_ip(query_ip) else cache_key
+        url = f"https://api.abuseipdb.com/api/v2/check?ipAddress={urllib.parse.quote(query_target)}"
+        req = urllib.request.Request(
+            url,
+            headers={"Key": ABUSEIPDB_API_KEY, "Accept": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=2.5) as resp:
+            data = json.loads(resp.read().decode("utf-8")).get("data", {})
+            res = {
+                "ip": query_ip if is_valid_ip(query_ip) else cache_key,
+                "host": query_host,
+                "score": str(data.get("abuseConfidenceScore", "0")),
+                "reports": str(data.get("totalReports", 0)),
+                "country": data.get("countryCode", "-"),
+                "domain": data.get("domain", "-"),
+                "isp": data.get("isp", "-"),
+                "usageType": data.get("usageType", "-"),
+                "whitelisted": data.get("isWhitelisted", False),
+                "error": None,
+            }
+            ABUSE_CACHE[cache_key] = res
+            try:
+                with open(cache_file, "w") as f:
+                    json.dump(res, f)
+            except Exception:
+                pass
+            return res
+    except Exception as e:
+        error_msg = str(e)
+        if "HTTP Error 429" in error_msg:
+            ABUSEIPDB_ENABLED = False
+            return {"ip": cache_key, "error": "AbuseIPDB Disabled (Rate Limited)"}
+        else:
+            return {"ip": cache_key, "error": error_msg}
+
+def trigger_async_abuse_fetch(target):
+    if not ABUSEIPDB_ENABLED:
+        return
+
+    if not target or target in ["-", "127.0.0.1", "::1"]:
+        return
+
+    cache_key = target
+    if not is_valid_ip(target):
+        try:
+            cache_key = socket.gethostbyname(target)
+        except Exception:
+            pass
+
+    cache_file = os.path.join(CACHE_DIR, f"{cache_key}.json")
+
+    if cache_key in ABUSE_CACHE:
+        if os.path.exists(cache_file):
+            file_mtime = os.path.getmtime(cache_file)
+            if time.time() - file_mtime < CACHE_TTL_SECONDS:
+                return
+
+    thread_pool.submit(fetch_abuse_data, cache_key)
+
+def query_abuseipdb_single(target, target_label):
+    global ABUSE_STATUS_MSG, ABUSEIPDB_ENABLED
+    if not ABUSEIPDB_ENABLED:
+        ABUSE_STATUS_MSG = "AbuseIPDB Disabled"
+        return
+    if not ABUSEIPDB_API_KEY:
+        ABUSE_STATUS_MSG = "AbuseIPDB API Key Not Set"
+        return
+    if not target or target == "-":
+        ABUSE_STATUS_MSG = f"Invalid {target_label}"
+        return
+
+    ABUSE_STATUS_MSG = f"Loading AbuseIPDB for {target_label} ({target})..."
+
+    def worker():
+        global ABUSE_STATUS_MSG
+        data = fetch_abuse_data(target)
+        if data.get("error"):
+            ABUSE_STATUS_MSG = f"AbuseIPDB Error: {data['error']}"
+        else:
+            msg = f"{data.get('ip', target)}  {data.get('country', '-')}  {data.get('isp', '-')}  {data.get('domain', '-')}  {data.get('score', '0')}%  {data.get('reports', '0')}"
+            ABUSE_STATUS_MSG = msg
+
+    thread_pool.submit(worker)
+
+def open_abuse_modal(sip, dip):
+    global MODAL_DATA, ABUSEIPDB_ENABLED
+
+    if not ABUSEIPDB_ENABLED:
+        with MODAL_LOCK:
+            MODAL_DATA = {
+                "sip": sip,
+                "dip": dip,
+                "s_data": {"ip": sip, "error": "AbuseIPDB Disabled"},
+                "d_data": {"ip": dip, "error": "AbuseIPDB Disabled"},
+            }
+        return
+
+    cache_file_sip = os.path.join(CACHE_DIR, f"{sip}.json")
+    cache_file_dip = os.path.join(CACHE_DIR, f"{dip}.json")
+    now = time.time()
+
+    s_initial = ABUSE_CACHE.get(sip) if (
+        sip in ABUSE_CACHE
+        and os.path.exists(cache_file_sip)
+        and (now - os.path.getmtime(cache_file_sip) < CACHE_TTL_SECONDS)
+    ) else {"ip": sip, "loading": True}
+    d_initial = ABUSE_CACHE.get(dip) if (
+        dip in ABUSE_CACHE
+        and os.path.exists(cache_file_dip)
+        and (now - os.path.getmtime(cache_file_dip) < CACHE_TTL_SECONDS)
+    ) else {"ip": dip, "loading": True}
+
+    with MODAL_LOCK:
+        MODAL_DATA = {
+            "sip": sip,
+            "dip": dip,
+            "s_data": s_initial,
+            "d_data": d_initial,
+        }
+
+    def get_cached_or_none(key, cache_path):
+        if key in ABUSE_CACHE and os.path.exists(cache_path):
+            if now - os.path.getmtime(cache_path) < CACHE_TTL_SECONDS:
+                return ABUSE_CACHE[key]
+        if os.path.exists(cache_path):
+            try:
+                if now - os.path.getmtime(cache_path) < CACHE_TTL_SECONDS:
+                    with open(cache_path, "r") as f:
+                        data = json.load(f)
+                        ABUSE_CACHE[key] = data
+                        return data
+            except Exception:
+                pass
+        return None
+
+    def worker():
+        s_res = get_cached_or_none(sip, cache_file_sip) or fetch_abuse_data(sip)
+        d_res = get_cached_or_none(dip, cache_file_dip) or fetch_abuse_data(dip)
+        with MODAL_LOCK:
+            if MODAL_DATA:
+                MODAL_DATA["s_data"] = s_res
+                MODAL_DATA["d_data"] = d_res
+
+    thread_pool.submit(worker)
+
+# --- Formatting Helpers ---
+def fmt_bytes(size):
+    try:
+        b = float(size)
+    except (ValueError, TypeError):
+        return "0 B"
+
+    if b >= 1073741824:
+        return f"{b / 1073741824:.1f} G"
+    elif b >= 1048576:
+        return f"{b / 1048576:.1f} M"
+    elif b >= 1024:
+        return f"{b / 1024:.1f} K"
+    return f"{int(b)} B"
+
+def clean_type(t):
+    return str(t).split("/")[-1].strip() if t else " "
+
+def parse_time(t):
+    if not t:
+        return " "
+    t_str = str(t)
+    return t_str.split("T")[1][:8] if "T" in t_str else " "
+
+# --- Process Connections Data ---
+def process_connections_payload(raw_conns):
+    global LATEST_CONNECTIONS, API_ERROR, SCROLL_OFFSET, SELECTED_ROW, AUTO_FOLLOW_MODE, SELECTED_CONN_ID, CONNECTION_HISTORY, GEO_CONNECTIONS_CACHE
+
+    filtered = raw_conns
+    active_ids = set()
+    now = time.time()
+
+    with CONNECTIONS_LOCK:
+        for c in filtered:
+            cid = c.get("id")
+            if cid:
+                active_ids.add(cid)
+                CONNECTION_HISTORY[cid] = {"data": c, "closed_at": None}
+
+        expired_ids = []
+        for cid, info in list(CONNECTION_HISTORY.items()):
+            if cid not in active_ids:
+                if info["closed_at"] is None:
+                    info["closed_at"] = now
+                elif now - info["closed_at"] > 10:
+                    expired_ids.append(cid)
+
+        for cid in expired_ids:
+            del CONNECTION_HISTORY[cid]
+            if cid in GEO_CONNECTIONS_CACHE:
+                del GEO_CONNECTIONS_CACHE[cid]
+
+        all_tracked = []
+        for cid, info in CONNECTION_HISTORY.items():
+            item_copy = dict(info["data"])
+            item_copy["_is_closed"] = (info["closed_at"] is not None)
+            all_tracked.append(item_copy)
+
+    filtered = all_tracked
+
+    if FILTER_QUERY:
+        fq = FILTER_QUERY.lower()
+        res = []
+        for c in filtered:
+            meta = c.get("metadata", {})
+            chains = c.get("chains", [])
+            chain_str = chains[0] if chains else ""
+
+            match = (
+                fq in clean_type(meta.get("type", "")).lower()
+                or fq in meta.get("sourceIP", "").lower()
+                or fq in meta.get("destinationIP", "").lower()
+                or fq in meta.get("host", "").lower()
+                or fq in meta.get("processPath", "").lower()
+                or fq in chain_str.lower()
+            )
+            if match:
+                res.append(c)
+        filtered = res
+
+    groups = {}
+    for c in filtered:
+        meta = c.get("metadata", {})
+        key = (
+            meta.get("type"),
+            meta.get("sourceIP"),
+            meta.get("destinationIP"),
+            meta.get("destinationPort"),
+            meta.get("host"),
+        )
+        groups.setdefault(key, []).append(c)
+
+    processed = []
+    for key, items in groups.items():
+        first = dict(items[0])
+        try:
+            upload = int(first.get("upload", 0))
+        except (ValueError, TypeError):
+            upload = 0
+        try:
+            download = int(first.get("download", 0))
+        except (ValueError, TypeError):
+            download = 0
+
+        first["count"] = str(len(items))
+        first["upload"] = upload
+        first["download"] = download
+        first["_is_closed"] = all(item.get("_is_closed", False) for item in items)
+        processed.append(first)
+
+    if SORT_BY == "upload":
+        processed.sort(key=lambda x: x["upload"], reverse=True)
+    elif SORT_BY == "download":
+        processed.sort(key=lambda x: x["download"], reverse=True)
+    elif SORT_BY == "end":
+        processed.sort(key=lambda x: x.get("start", ""), reverse=True)
+    else:
+        processed.sort(key=lambda x: x.get("start", ""))
+
+    for c in processed:
+        meta = c.get("metadata", {})
+        sip = meta.get("sourceIP")
+        if sip:
+            trigger_async_abuse_fetch(sip)
+        dip = str(meta.get("destinationIP") or "-")
+        host = str(meta.get("host") or "-")
+        target_key = dip if dip != "-" else host
+        if target_key:
+            trigger_async_abuse_fetch(target_key)
+            ab_info = ABUSE_CACHE.get(target_key, {})
+            if isinstance(ab_info, dict) and ab_info.get("country") == GEO_COUNTRY_CODE:
+                cid = c.get("id")
+                if cid:
+                    GEO_CONNECTIONS_CACHE[cid] = c
+
+    with CONNECTIONS_LOCK:
+        new_len = len(processed)
+
+        if AUTO_FOLLOW_MODE == "top":
+            SCROLL_OFFSET = 0
+            if SELECTED_ROW == 0:
+                SELECTED_ROW = 0
+                if processed:
+                    SELECTED_CONN_ID = processed[0].get("id")
+            elif SELECTED_CONN_ID and processed:
+                found_index = None
+                for idx, item in enumerate(processed):
+                    if item.get("id") == SELECTED_CONN_ID:
+                        found_index = idx
+                        break
+                if found_index is not None:
+                    SELECTED_ROW = found_index
+                else:
+                    SELECTED_ROW = min(SELECTED_ROW, new_len - 1)
+                    if new_len > 0:
+                        SELECTED_CONN_ID = processed[SELECTED_ROW].get("id")
+        elif AUTO_FOLLOW_MODE == "bottom" and new_len > 0 and SORT_BY == "start":
+            SELECTED_ROW = new_len - 1
+            SELECTED_CONN_ID = processed[-1].get("id")
+        elif SELECTED_CONN_ID and processed:
+            found_index = None
+            for idx, item in enumerate(processed):
+                if item.get("id") == SELECTED_CONN_ID:
+                    found_index = idx
+                    break
+
+            if found_index is not None:
+                SELECTED_ROW = found_index
+            else:
+                SELECTED_ROW = min(SELECTED_ROW, new_len - 1)
+                SELECTED_CONN_ID = processed[SELECTED_ROW].get("id") if new_len > 0 else None
+
+        LATEST_CONNECTIONS = processed
+        API_ERROR = None
+
+def background_websocket_loop():
+    global API_ERROR
+
+    raw_api = SINGBOX_API.strip()
+    if not raw_api.startswith(("http://", "https://", "ws://", "wss://")):
+        raw_api = "http://" + raw_api
+
+    parsed = urllib.parse.urlparse(raw_api)
+    host_port = parsed.netloc if parsed.netloc else parsed.path.split('/')[0]
+
+    scheme = "wss" if parsed.scheme in ["https", "wss"] else "ws"
+    ws_url = f"{scheme}://{host_port}/connections"
+
+    if SINGBOX_SECRET:
+        ws_url += f"?secret={urllib.parse.quote(SINGBOX_SECRET)}"
+
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Origin": f"http://{host_port}",
+    }
+    if SINGBOX_SECRET:
+        headers["Authorization"] = f"Bearer {SINGBOX_SECRET}"
+
+    while True:
+        try:
+            ws = websocket.create_connection(
+                ws_url,
+                header=headers,
+                timeout=5,
+                ping_interval=10,
+                ping_timeout=5
+            )
+            with CONNECTIONS_LOCK:
+                API_ERROR = None
+
+            while True:
+                if IS_PAUSED:
+                    time.sleep(0.2)
+                    continue
+
+                message = ws.recv()
+                if not message:
+                    break
+
+                data = json.loads(message)
+                if "connections" in data and isinstance(data["connections"], list):
+                    process_connections_payload(data["connections"])
+
+        except websocket.WebSocketBadStatusException as e:
+            with CONNECTIONS_LOCK:
+                API_ERROR = f"✗ sing-box WS Rejected (HTTP {e.status_code})"
+            time.sleep(2)
+        except Exception as e:
+            with CONNECTIONS_LOCK:
+                API_ERROR = f"✗ WS Error ({type(e).__name__}: {str(e)})"
+            time.sleep(2)
+
+# --- Robust Curses Input Dialog ---
+def curses_prompt(stdscr, prompt_symbol):
+    h, w = stdscr.getmaxyx()
+
+    stdscr.nodelay(False)
+    curses.echo()
+    curses.curs_set(1)
+
+    stdscr.move(h - 1, 0)
+    stdscr.clrtoeol()
+    stdscr.addstr(h - 1, 0, f"{prompt_symbol} ", curses.color_pair(CP_MAGENTA) | curses.A_BOLD)
+    stdscr.refresh()
+
+    try:
+        input_bytes = stdscr.getstr(h - 1, len(prompt_symbol) + 1)
+        val = input_bytes.decode("utf-8").strip()
+    except Exception:
+        val = ""
+
+    curses.noecho()
+    curses.curs_set(0)
+    stdscr.nodelay(True)
+    return val
+
+# --- Modal Window Overlay ---
+def draw_modal_overlay(stdscr):
+    global MODAL_WIN
+    with MODAL_LOCK:
+        if not MODAL_DATA:
+            MODAL_WIN = None
+            return
+        modal_copy = dict(MODAL_DATA)
+
+    h, w = stdscr.getmaxyx()
+    box_h = min(16, h - 4)
+    box_w = min(76, w - 4)
+    if box_h < 8 or box_w < 30:
+        return
+
+    start_y = (h - box_h) // 2
+    start_x = (w - box_w) // 2
+
+    try:
+        if MODAL_WIN is None:
+            MODAL_WIN = curses.newwin(box_h, box_w, start_y, start_x)
+
+        MODAL_WIN.erase()
+        MODAL_WIN.attron(curses.color_pair(CP_MAGENTA) | curses.A_BOLD)
+        MODAL_WIN.box()
+        MODAL_WIN.addstr(0, 2, " AbuseIPDB Connection Details ", curses.color_pair(CP_MAGENTA) | curses.A_BOLD)
+        MODAL_WIN.attroff(curses.color_pair(CP_MAGENTA) | curses.A_BOLD)
+
+        def draw_ip_block(y_offset, title, data):
+            MODAL_WIN.addstr(y_offset, 2, f"{title} {data.get('country', '-')} {data.get('ip', '-')} {data.get('score', '0')}%  {data.get('reports', 0)}", curses.color_pair(CP_YELLOW) | curses.A_BOLD)
+            if data.get("loading"):
+                MODAL_WIN.addstr(y_offset + 1, 4, "Fetching threat intelligence...", curses.A_BOLD)
+            elif data.get("error"):
+                MODAL_WIN.addstr(y_offset + 1, 4, f"Error: {data['error']}", curses.color_pair(CP_ERROR) | curses.A_BOLD)
+            else:
+                MODAL_WIN.addstr(y_offset + 2, 4, f"{data.get('isp', '-')[:box_w - 10]}", curses.A_BOLD)
+                MODAL_WIN.addstr(y_offset + 3, 4, f"{data.get('domain', '-')}  {data.get('usageType', '-')}", curses.A_BOLD)
+
+        draw_ip_block(2, " ", modal_copy.get("s_data", {}))
+        draw_ip_block(8, " ", modal_copy.get("d_data", {}))
+
+        MODAL_WIN.addstr(box_h - 2, 2, " ", curses.color_pair(CP_MAGENTA) | curses.A_BOLD)
+        MODAL_WIN.refresh()
+    except curses.error:
+        pass
+
+# --- UI Renderer ---
+def draw_main_interface(stdscr):
+    global SELECTED_ROW, SCROLL_OFFSET, AUTO_FOLLOW_MODE, GEO_SELECTED_ROW, GEO_SCROLL_OFFSET
+
+    h, w = stdscr.getmaxyx()
+    max_visible_rows = max(1, h - 2)
+
+    with CONNECTIONS_LOCK:
+        if IN_GEO_VIEW:
+            conns = list(GEO_CONNECTIONS_CACHE.values())
+            conns.sort(key=lambda x: x.get("start", ""), reverse=True)
+        else:
+            conns = list(LATEST_CONNECTIONS)
+        err = API_ERROR
+
+    if err:
+        stdscr.addstr(0, 0, err, curses.color_pair(CP_ERROR) | curses.A_BOLD)
+        return
+
+    if not conns:
+        msg = "No GEO connections cached." if IN_GEO_VIEW else "No active connections."
+        stdscr.addstr(0, 0, msg, curses.color_pair(CP_MAGENTA) | curses.A_BOLD)
+
+    sel_row = GEO_SELECTED_ROW if IN_GEO_VIEW else SELECTED_ROW
+    scroll_off = GEO_SCROLL_OFFSET if IN_GEO_VIEW else SCROLL_OFFSET
+
+    if sel_row >= len(conns):
+        sel_row = max(0, len(conns) - 1)
+        if IN_GEO_VIEW:
+            GEO_SELECTED_ROW = sel_row
+        else:
+            SELECTED_ROW = sel_row
+
+    if not IN_GEO_VIEW:
+        if AUTO_FOLLOW_MODE == "bottom" and len(conns) > 0 and SORT_BY == "start":
+            SCROLL_OFFSET = max(0, len(conns) - max_visible_rows)
+        else:
+            if SELECTED_ROW < SCROLL_OFFSET:
+                SCROLL_OFFSET = SELECTED_ROW
+            elif SELECTED_ROW >= SCROLL_OFFSET + max_visible_rows:
+                SCROLL_OFFSET = SELECTED_ROW - max_visible_rows + 1
+
+        if SCROLL_OFFSET == 0 and AUTO_FOLLOW_MODE != "bottom":
+            AUTO_FOLLOW_MODE = "top"
+        elif SCROLL_OFFSET > 0 and AUTO_FOLLOW_MODE == "top":
+            AUTO_FOLLOW_MODE = "none"
+        scroll_off = SCROLL_OFFSET
+    else:
+        if GEO_SELECTED_ROW < GEO_SCROLL_OFFSET:
+            GEO_SCROLL_OFFSET = GEO_SELECTED_ROW
+        elif GEO_SELECTED_ROW >= GEO_SCROLL_OFFSET + max_visible_rows:
+            GEO_SCROLL_OFFSET = GEO_SELECTED_ROW - max_visible_rows + 1
+        scroll_off = GEO_SCROLL_OFFSET
+
+    table_data = []
+    for i, c in enumerate(conns):
+        meta = c.get("metadata", {})
+        sip = str(meta.get("sourceIP") or "-")
+        dip = str(meta.get("destinationIP") or "-")
+        host = str(meta.get("host") or "-")
+        target_key = dip if dip != "-" else host
+
+        s_ab_info = ABUSE_CACHE.get(sip, {})
+        ab_info = ABUSE_CACHE.get(target_key, {})
+
+        raw_score = ab_info.get("score") if isinstance(ab_info, dict) else None
+        score_str = f"{raw_score}%" if raw_score is not None else "-"
+        reports_str = str(ab_info.get("reports", "-")) if isinstance(ab_info, dict) else "-"
+
+        table_data.append({
+            "num": str(i + 1),
+            "type": clean_type(meta.get("type")),
+            "sip": sip,
+            "scc": s_ab_info.get("country", "-") if isinstance(s_ab_info, dict) else "-",
+            "count": str(c.get("count", "1")),
+            "cc": ab_info.get("country", "-") if isinstance(ab_info, dict) else "-",
+            "dip": dip,
+            "host": host,
+            "dport": str(meta.get("destinationPort") or "-"),
+            "up": fmt_bytes(c.get("upload", 0)),
+            "down": fmt_bytes(c.get("download", 0)),
+            "score": score_str,
+            "reports": reports_str,
+            "time": parse_time(c.get("start")),
+            "isp": ab_info.get("isp", "-") if isinstance(ab_info, dict) else "-",
+            "usage": ab_info.get("usageType", "-") if isinstance(ab_info, dict) else "-",
+            "raw_up": c.get("upload", 0),
+            "raw_down": c.get("download", 0),
+            "raw_dip": target_key,
+            "raw_is_closed": c.get("_is_closed", False),
+        })
+
+    cols = ["type", "sip", "scc", "count", "cc", "dip", "host", "dport", "up", "down", "score", "reports", "time", "isp", "usage"]
+    visible_rows = table_data[scroll_off : scroll_off + max_visible_rows]
+
+    col_widths = {k: 0 for k in cols}
+    for row in visible_rows:
+        for k in cols:
+            col_widths[k] = max(col_widths[k], len(row[k]))
+
+    max_visible_count_len = max([len(r["count"]) for r in visible_rows], default=1)
+    col_widths["count"] = max_visible_count_len
+
+    MAGENTA_COL_KEYS = {"count", "scc", "cc", "isp", "usage", "score", "reports"}
+    GREEN_COL_KEYS = {"dip", "host"}
+
+    for screen_y, row in enumerate(visible_rows):
+        actual_idx = scroll_off + screen_y
+
+        is_geo = ABUSE_CACHE.get(row["raw_dip"], {}).get("country") == GEO_COUNTRY_CODE
+        is_dead = row["raw_up"] == 0 or row["raw_down"] == 0
+        is_closed = row["raw_is_closed"]
+
+        row_color = curses.color_pair(CP_DEFAULT)
+        if is_geo:
+            row_color = curses.color_pair(CP_GEO)
+        elif is_dead:
+            row_color = curses.color_pair(CP_ERROR)
+        elif is_closed:
+            row_color = curses.color_pair(CP_CLOSED)
+
+        is_selected = (actual_idx == sel_row)
+
+        col_values = [
+            ("type", row["type"].ljust(col_widths["type"])),
+            ("sip", row["sip"].rjust(col_widths["sip"])),
+            ("scc", row["scc"].ljust(col_widths["scc"])),
+            ("count", row["count"].rjust(col_widths["count"])),
+            ("cc", row["cc"].ljust(col_widths["cc"])),
+            ("dip", row["dip"].ljust(col_widths["dip"])),
+            ("host", row["host"].ljust(col_widths["host"])),
+            ("dport", row["dport"].rjust(col_widths["dport"])),
+            ("up", row["up"].rjust(col_widths["up"])),
+            ("down", row["down"].rjust(col_widths["down"])),
+            ("score", row["score"].rjust(col_widths["score"])),
+            ("reports", row["reports"].rjust(col_widths["reports"])),
+            ("time", row["time"].ljust(col_widths["time"])),
+            ("isp", row["isp"].ljust(col_widths["isp"])),
+            ("usage", row["usage"].ljust(col_widths["usage"])),
+        ]
+
+        curr_x = 0
+        for col_idx, (col_key, col_str) in enumerate(col_values):
+            if curr_x >= w:
+                break
+
+            if is_selected:
+                selected_pair = curses.color_pair(CP_SEL_DEAD) if is_dead else curses.color_pair(CP_SEL)
+                cell_style = selected_pair | curses.A_BOLD
+            else:
+                if is_dead and col_key in GREEN_COL_KEYS:
+                    cell_style = curses.color_pair(CP_ERROR) | curses.A_BOLD
+                elif col_key in GREEN_COL_KEYS:
+                    cell_style = curses.color_pair(CP_GREEN) | curses.A_BOLD
+                elif col_key in MAGENTA_COL_KEYS:
+                    cell_style = curses.color_pair(CP_MAGENTA) | curses.A_BOLD
+                else:
+                    cell_style = row_color | curses.A_BOLD
+
+            chunk = col_str[: w - curr_x]
+            try:
+                stdscr.addstr(screen_y, curr_x, chunk, cell_style)
+            except curses.error:
+                pass
+
+            curr_x += len(chunk)
+
+            if col_idx < len(col_values) - 1 and curr_x < w:
+                sep_str = "  "
+                sep = sep_str[: w - curr_x]
+                if is_selected:
+                    selected_pair = curses.color_pair(CP_SEL_DEAD) if is_dead else curses.color_pair(CP_SEL)
+                    sep_style = selected_pair | curses.A_BOLD
+                else:
+                    sep_style = row_color | curses.A_BOLD
+                try:
+                    stdscr.addstr(screen_y, curr_x, sep, sep_style)
+                except curses.error:
+                    pass
+                curr_x += len(sep)
+
+        if is_selected:
+            selected_pair = curses.color_pair(CP_SEL_DEAD) if is_dead else curses.color_pair(CP_SEL)
+            try:
+                if curr_x < w:
+                    stdscr.addstr(screen_y, curr_x, " " * (w - curr_x), selected_pair | curses.A_BOLD)
+            except curses.error:
+                pass
+
+            try:
+                stdscr.chgat(screen_y, 0, w, selected_pair | curses.A_BOLD)
+            except curses.error:
+                pass
+
+    sort_icon = ""
+    if SORT_BY == "download":
+        sort_icon = ""
+    elif SORT_BY == "upload":
+        sort_icon = ""
+    elif SORT_BY == "end":
+        sort_icon = ""
+
+    status_items = []
+    if IS_PAUSED == True:
+        status_items.append(("", curses.color_pair(CP_MAGENTA) | curses.A_BOLD))
+    elif IS_PAUSED == False:
+        status_items.append(("", curses.color_pair(CP_MAGENTA) | curses.A_BOLD))
+    if not IN_GEO_VIEW:
+        if AUTO_FOLLOW_MODE == "bottom" and SORT_BY == "start":
+            status_items.append(("", curses.color_pair(CP_MAGENTA) | curses.A_BOLD))
+        elif AUTO_FOLLOW_MODE == "top":
+            status_items.append(("", curses.color_pair(CP_MAGENTA) | curses.A_BOLD))
+        if sort_icon:
+            status_items.append((sort_icon, curses.color_pair(CP_MAGENTA) | curses.A_BOLD))
+
+    if CHECK_GEO_IPS:
+        status_items.append(("󰰟", curses.color_pair(CP_MAGENTA) | curses.A_BOLD))
+    if IN_GEO_VIEW:
+        status_items.append(("", curses.color_pair(CP_MAGENTA) | curses.A_BOLD))
+    geo_count = len(GEO_CONNECTIONS_CACHE)
+
+    if FILTER_QUERY:
+        status_items.append((f" {FILTER_QUERY}", curses.color_pair(CP_MAGENTA) | curses.A_BOLD))
+    if ABUSE_STATUS_MSG:
+        status_items.append((ABUSE_STATUS_MSG, curses.color_pair(CP_MAGENTA) | curses.A_BOLD))
+
+    current_pos = (sel_row + 1) if conns else 0
+    scroll_pct = f"{geo_count} {current_pos}/{len(conns)}"
+
+    try:
+        stdscr.move(h - 1, 0)
+        stdscr.clrtoeol()
+
+        curr_x = 0
+        max_status_w = w - len(scroll_pct) - 2
+        for idx, (text, attr) in enumerate(status_items):
+            if curr_x >= max_status_w:
+                break
+            prefix = " " if idx > 0 else ""
+            item_str = prefix + text
+            chunk = item_str[: max_status_w - curr_x]
+            try:
+                stdscr.addstr(h - 1, curr_x, chunk, attr)
+            except curses.error:
+                pass
+            curr_x += len(chunk)
+
+        right_x = max(0, w - len(scroll_pct) - 1)
+        stdscr.addstr(h - 1, right_x, scroll_pct, curses.color_pair(CP_MAGENTA) | curses.A_BOLD)
+
+    except curses.error:
+        pass
+
+def update_selection_id(conns):
+    global SELECTED_CONN_ID, GEO_SELECTED_CONN_ID
+    if IN_GEO_VIEW:
+        if 0 <= GEO_SELECTED_ROW < len(conns):
+            GEO_SELECTED_CONN_ID = conns[GEO_SELECTED_ROW].get("id")
+    else:
+        if 0 <= SELECTED_ROW < len(conns):
+            SELECTED_CONN_ID = conns[SELECTED_ROW].get("id")
+
+def draw_ui(stdscr):
+    global SORT_BY, FILTER_QUERY, CHECK_GEO_IPS, IS_PAUSED, ABUSE_STATUS_MSG
+    global SELECTED_ROW, SCROLL_OFFSET, MODAL_DATA, MODAL_WIN, AUTO_FOLLOW_MODE, SELECTED_CONN_ID
+    global IN_GEO_VIEW, GEO_SELECTED_ROW, GEO_SCROLL_OFFSET, GEO_SELECTED_CONN_ID
+
+    curses.use_default_colors()
+    curses.curs_set(0)
+    stdscr.nodelay(True)
+    stdscr.timeout(50)
+
+    curses.init_pair(CP_ERROR, curses.COLOR_RED, -1)
+    curses.init_pair(CP_GREEN, curses.COLOR_GREEN, -1)
+    curses.init_pair(CP_MAGENTA, curses.COLOR_MAGENTA, -1)
+    curses.init_pair(CP_GEO, curses.COLOR_BLUE, -1)
+    curses.init_pair(CP_YELLOW, curses.COLOR_YELLOW, -1)
+    curses.init_pair(CP_SEL, curses.COLOR_BLACK, curses.COLOR_MAGENTA)  # Normal selection bar
+    curses.init_pair(CP_SEL_DEAD, curses.COLOR_BLACK, curses.COLOR_RED)      # 0 B traffic selection bar
+    curses.init_pair(CP_CLOSED, 8, -1)  # Bright black (dark gray) for closed connections
+
+    fetch_thread = threading.Thread(target=background_websocket_loop, daemon=True)
+    fetch_thread.start()
+
+    modal_active_last_frame = False
+
+    while True:
+        key = stdscr.getch()
+
+        with MODAL_LOCK:
+            has_modal = MODAL_DATA is not None
+
+        if has_modal:
+            if not modal_active_last_frame:
+                stdscr.erase()
+                draw_main_interface(stdscr)
+                stdscr.refresh()
+                modal_active_last_frame = True
+
+            if key in [27, ord("q"), ord("Q"), curses.KEY_ENTER, 10, 13]:
+                with MODAL_LOCK:
+                    MODAL_DATA = None
+                    MODAL_WIN = None
+                modal_active_last_frame = False
+                stdscr.erase()
+                draw_main_interface(stdscr)
+                stdscr.refresh()
+                continue
+
+            draw_modal_overlay(stdscr)
+            continue
+
+        modal_active_last_frame = False
+
+        with CONNECTIONS_LOCK:
+            if IN_GEO_VIEW:
+                conns = list(GEO_CONNECTIONS_CACHE.values())
+                conns.sort(key=lambda x: x.get("start", ""), reverse=True)
+            else:
+                conns = list(LATEST_CONNECTIONS)
+
+        if key in [ord("q"), ord("Q")]:
+            break
+        elif key == 27:
+            if not IN_GEO_VIEW:
+                IN_GEO_VIEW = True
+                GEO_SELECTED_ROW = 0
+                GEO_SCROLL_OFFSET = 0
+                continue
+            else:
+                IN_GEO_VIEW = False
+                continue
+        elif key in [ord("x"), ord("X")]:
+            # Toggle GEO view (formerly TAB behavior)
+            if IN_GEO_VIEW:
+                IN_GEO_VIEW = False
+            else:
+                IN_GEO_VIEW = True
+                GEO_SELECTED_ROW = 0
+                GEO_SCROLL_OFFSET = 0
+        elif key in [ord("p"), ord("P"), ord(" ")]:
+            IS_PAUSED = not IS_PAUSED
+        elif key in [ord("r"), ord("R")]:
+            CHECK_GEO_IPS = not CHECK_GEO_IPS
+        elif key in [ord("s"), ord("S")]:
+            if not IN_GEO_VIEW:
+                if SORT_BY == "start":
+                    SORT_BY = "end"
+                elif SORT_BY == "end":
+                    SORT_BY = "upload"
+                elif SORT_BY == "upload":
+                    SORT_BY = "download"
+                else:
+                    SORT_BY = "start"
+
+                if SORT_BY != "start" and AUTO_FOLLOW_MODE == "bottom":
+                    AUTO_FOLLOW_MODE = "none"
+
+                update_selection_id(conns)
+        elif key == curses.KEY_UP:
+            if IN_GEO_VIEW:
+                if GEO_SELECTED_ROW > 0:
+                    GEO_SELECTED_ROW -= 1
+                update_selection_id(conns)
+            else:
+                if SELECTED_ROW > 0:
+                    SELECTED_ROW -= 1
+                update_selection_id(conns)
+        elif key == curses.KEY_DOWN:
+            if IN_GEO_VIEW:
+                if GEO_SELECTED_ROW < len(conns) - 1:
+                    GEO_SELECTED_ROW += 1
+                update_selection_id(conns)
+            else:
+                if SELECTED_ROW < len(conns) - 1:
+                    SELECTED_ROW += 1
+                    if SELECTED_ROW == len(conns) - 1 and SORT_BY == "start":
+                        AUTO_FOLLOW_MODE = "bottom"
+                elif SORT_BY == "start":
+                    AUTO_FOLLOW_MODE = "bottom"
+                update_selection_id(conns)
+        elif key in [curses.KEY_HOME, ord("g")]:
+            if IN_GEO_VIEW:
+                GEO_SELECTED_ROW = 0
+                GEO_SCROLL_OFFSET = 0
+                update_selection_id(conns)
+            else:
+                SELECTED_ROW = 0
+                SCROLL_OFFSET = 0
+                AUTO_FOLLOW_MODE = "top"
+                update_selection_id(conns)
+        elif key in [curses.KEY_END, ord("G")]:
+            if conns:
+                if IN_GEO_VIEW:
+                    GEO_SELECTED_ROW = len(conns) - 1
+                    update_selection_id(conns)
+                else:
+                    SELECTED_ROW = len(conns) - 1
+                    if SORT_BY == "start":
+                        AUTO_FOLLOW_MODE = "bottom"
+                    update_selection_id(conns)
+        elif key == curses.KEY_NPAGE:  # Page Down (^[[6~)
+            h, _ = stdscr.getmaxyx()
+            page_size = max(1, h - 2)
+            if IN_GEO_VIEW:
+                GEO_SELECTED_ROW = min(len(conns) - 1, GEO_SELECTED_ROW + page_size)
+                update_selection_id(conns)
+            else:
+                SELECTED_ROW = min(len(conns) - 1, SELECTED_ROW + page_size)
+                if SELECTED_ROW == len(conns) - 1 and SORT_BY == "start":
+                    AUTO_FOLLOW_MODE = "bottom"
+                update_selection_id(conns)
+        elif key == curses.KEY_PPAGE:  # Page Up (^[[5~)
+            h, _ = stdscr.getmaxyx()
+            page_size = max(1, h - 2)
+            if IN_GEO_VIEW:
+                GEO_SELECTED_ROW = max(0, GEO_SELECTED_ROW - page_size)
+                update_selection_id(conns)
+            else:
+                SELECTED_ROW = max(0, SELECTED_ROW - page_size)
+                update_selection_id(conns)
+        elif key in [curses.KEY_ENTER, 10, 13]:
+            sel_idx = GEO_SELECTED_ROW if IN_GEO_VIEW else SELECTED_ROW
+            if 0 <= sel_idx < len(conns):
+                meta = conns[sel_idx].get("metadata", {})
+                sip = meta.get("sourceIP")
+                dip = meta.get("destinationIP") or meta.get("host")
+                open_abuse_modal(sip, dip)
+
+        elif key in [ord("f"), ord("F")]:
+            if not IN_GEO_VIEW:
+                FILTER_QUERY = curses_prompt(stdscr, " Filter:")
+                update_selection_id(conns)
+
+        elif key in [ord("k"), ord("K")]:
+            sel_idx = GEO_SELECTED_ROW if IN_GEO_VIEW else SELECTED_ROW
+            if 0 <= sel_idx < len(conns):
+                conn_id = conns[sel_idx].get("id")
+                if conn_id:
+                    threading.Thread(
+                        target=api_request,
+                        args=(f"connections/{conn_id}", "DELETE"),
+                        daemon=True,
+                    ).start()
+                    ABUSE_STATUS_MSG = f"Killed connection #{sel_idx + 1}"
+        elif key == ord("c"):
+            # Copy selected destinationIP
+            sel_idx = GEO_SELECTED_ROW if IN_GEO_VIEW else SELECTED_ROW
+            if 0 <= sel_idx < len(conns):
+                meta = conns[sel_idx].get("metadata", {})
+                target = meta.get("destinationIP") or meta.get("host") or "-"
+                label = "Dest IP"
+                ABUSE_STATUS_MSG = f"󰆏 {target}" if copy_to_clipboard(target) else "Clipboard failed"
+        elif key == ord("C"):
+            # Copy selected sourceIP (Shift+c)
+            sel_idx = GEO_SELECTED_ROW if IN_GEO_VIEW else SELECTED_ROW
+            if 0 <= sel_idx < len(conns):
+                sip = conns[sel_idx].get("metadata", {}).get("sourceIP")
+                ABUSE_STATUS_MSG = f"󰆏 {sip}" if copy_to_clipboard(sip) else "Clipboard failed"
+        elif key == ord("d"):
+            # Copy domain (host) from selected row
+            sel_idx = GEO_SELECTED_ROW if IN_GEO_VIEW else SELECTED_ROW
+            if 0 <= sel_idx < len(conns):
+                meta = conns[sel_idx].get("metadata", {})
+                host_val = meta.get("host") or "-"
+                ABUSE_STATUS_MSG = f"󰆏 {host_val}" if copy_to_clipboard(host_val) else "Clipboard failed"
+
+        # Tab: add selected line to GEO view manually (formerly X behavior)
+        elif key == ord('\t'):
+            sel_idx = GEO_SELECTED_ROW if IN_GEO_VIEW else SELECTED_ROW
+            if 0 <= sel_idx < len(conns):
+                conn = conns[sel_idx]
+                conn_id = conn.get("id")
+                if conn_id:
+                    with CONNECTIONS_LOCK:
+                        GEO_CONNECTIONS_CACHE[conn_id] = conn
+
+        # Backspace: remove selected line from GEO view
+        elif key in (curses.KEY_BACKSPACE, 127, 8):
+            if IN_GEO_VIEW:
+                sel_idx = GEO_SELECTED_ROW
+                if 0 <= sel_idx < len(conns):
+                    conn = conns[sel_idx]
+                    conn_id = conn.get("id")
+                    if conn_id:
+                        with CONNECTIONS_LOCK:
+                            GEO_CONNECTIONS_CACHE.pop(conn_id, None)
+                        if GEO_SELECTED_ROW >= len(GEO_CONNECTIONS_CACHE):
+                            GEO_SELECTED_ROW = max(0, len(GEO_CONNECTIONS_CACHE) - 1)
+
+        stdscr.erase()
+        draw_main_interface(stdscr)
+        stdscr.refresh()
+
+def main():
+    set_terminal_title(TAB_NAME)
+    try:
+        curses.wrapper(draw_ui)
+    except KeyboardInterrupt:
+        sys.exit(0)
+
+if __name__ == "__main__":
+    main()
