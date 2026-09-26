@@ -14,22 +14,22 @@ A TUI panel to directly talk to [Sing-Box](https://github.com/SagerNet/sing-box)
 ## Shortcuts for the server version
 
 - <b>Enter</b>  Shows a popup with queried information about incomming and outgoing IP
-- Escape  Toggles Catch list
-- Tab  Adds current selection to Catch list
-- R  Toggles catching of outgoing connections by country code into the Catch list. (Default RU)
-- K  Kills selected connection
-- C  Copies outgoing IP
-- Shift+C  Copies incomming IP
-- D  Copies domain name
-- S  Changes sort order
+- <b>Escape</b>  Toggles Catch list
+- <b>Tab</b>  Adds current selection to Catch list
+- <b>R</b>  Toggles catching of outgoing connections by country code into the Catch list. (Default RU)
+- <b>K</b>  Kills selected connection
+- <b>C</b>  Copies outgoing IP
+- <b>Shift+C</b>  Copies incomming IP
+- <b>D</b>  Copies domain name
+- <b>S</b>  Changes sort order
 
 ## Shortcuts for the client version
 
-- Enter  Shows a popup with queried information about outgoing IP
-- K  Kills selected connection
-- C  Copies outgoing IP
-- D  Copies domain name
-- S  Changes sort order
+- <b>Enter</b>  Shows a popup with queried information about outgoing IP
+- <b>K</b>  Kills selected connection
+- <b>C</b>  Copies outgoing IP
+- <b>D</b>  Copies domain name
+- <b>S</b>  Changes sort order
 
 # Information
 All settings can be set directly in the Python code.
