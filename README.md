@@ -8,28 +8,28 @@ A TUI panel for [Sing-Box](https://github.com/SagerNet/sing-box)’s API calls u
 #### Features
 
   1. Visually pleasant minimal design.
-  2. Highlights problematic connections and outgoing IP’s to specific country code.
+  2. Highlights problematic connections and destination IP’s by specific country code.
   3. AbuseIPDB API integration to instantly fetch and cache additional information about all outbound and inbound IP’s
-  4. A simple catching system for outgoing IP’s based on cached AbuseIPDB queries by country code.
+  4. A simple catching system for destination IP’s based on cached AbuseIPDB queries by country code.
 
 #### Shortcuts for the server version
 
 - <b>Enter</b>  Shows a popup with queried information about selected connection
 - <b>Escape</b>  Toggles Catch list
 - <b>Tab</b>  Adds current selection to Catch list
-- <b>R</b>  Toggles catching of outgoing connections by country code. (Default RU)
+- <b>R</b>  Toggles catching of destination IP’s by country code. (Default RU)
 - <b>K</b>  Kills selected connection
-- <b>C</b>  Copies outgoing IP
-- <b>Shift+C</b>  Copies incomming IP
+- <b>C</b>  Copies destination IP
+- <b>Shift+C</b>  Copies source IP
 - <b>D</b>  Copies domain name
 - <b>S</b>  Changes sort order
 
 #### Shortcuts for the client version
 
-- <b>Enter</b>  Shows a popup with queried information about outgoing IP
+- <b>Enter</b>  Shows a popup with queried information about destinaion IP
 - <b>Escape</b>  Opens outbound proxy selector
 - <b>K</b>  Kills selected connection
-- <b>C</b>  Copies outgoing IP
+- <b>C</b>  Copies destination IP
 - <b>D</b>  Copies domain name
 - <b>S</b>  Changes sort direction and sort order by most uploaded or downloaded.
 
