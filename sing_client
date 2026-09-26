@@ -1,0 +1,1050 @@
+#!/usr/bin/env python3
+import curses
+import json
+import os
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+
+# Reduce curses escape key delay from default (1000ms) to 25ms for instant response
+os.environ["ESCDELAY"] = "25"
+
+try:
+    import websocket
+except ImportError:
+    print("Missing required dependency: 'websocket-client'. Attempting automatic installation...")
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "websocket-client"])
+        import websocket
+        print("Successfully installed 'websocket-client'. Starting script...")
+    except Exception as e:
+        print(f"Error: Failed to automatically install 'websocket-client' ({e}).")
+        print("Please install it manually using: pip install websocket-client")
+        sys.exit(1)
+
+# Global Config / Defaults
+SINGBOX_API = os.environ.get("SINGBOX_API", "http://127.0.0.1:9090")
+SINGBOX_SECRET = os.environ.get("SINGBOX_SECRET", "SECRET")
+PROXY_GROUP = os.environ.get("SINGBOX_PROXY_GROUP", "Proxy")
+ABUSEIPDB_API_KEY = os.environ.get("ABUSEIPDB_API_KEY", "SECRET")
+TAB_NAME = os.environ.get("SINGBOX_TAB_NAME", "<b>Local</b>")  # Terminal Tab / Window Name
+CACHE_DIR = "/tmp/singbox_script_cache"
+
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+# State Variables
+SORT_BY = "end"  # "start", "end", "upload", "download"
+FILTER_QUERY = sys.argv[1] if len(sys.argv) > 1 else ""
+CHECK_RU_IPS = False
+IS_PAUSED = False
+ABUSE_STATUS_MSG = ""
+SELECTED_ROW = 0
+SELECTED_CONN_ID = None  # Unique connection tracker
+SCROLL_OFFSET = 0  # Offscreen scrolling line tracking
+AUTO_FOLLOW_MODE = "top"  # "top", "bottom", or "none"
+
+# Native Proxy Selector State & Caching
+IN_PROXY_SELECTOR = False
+PROXY_CACHE_LOCK = threading.Lock()
+CACHED_PROXY_NODES = []
+CACHED_CURRENT_NODE = ""
+PROXY_SELECTED_ROW = 0
+
+# Modal state
+MODAL_DATA = None
+MODAL_LOCK = threading.Lock()
+MODAL_WIN = None
+
+# In-Memory Cache & Async Data Store
+IP_COUNTRY_CACHE = {}
+ABUSE_CACHE = {}
+CONNECTION_HISTORY = {}
+
+CONNECTIONS_LOCK = threading.Lock()
+LATEST_CONNECTIONS = []
+API_ERROR = None
+
+
+# --- Terminal Tab Title Helper ---
+
+def set_terminal_title(title):
+    if title:
+        sys.stdout.write(f"\033]0;{title}\007")
+        sys.stdout.flush()
+
+
+# --- Clipboard Helpers ---
+
+def get_clipboard_cmd():
+    for cmd in ["pbcopy", "xclip -selection clipboard", "xsel --clipboard --input", "wl-copy"]:
+        binary = cmd.split()[0]
+        if subprocess.call(f"command -v {binary} >/dev/null 2>&1", shell=True) == 0:
+            return cmd
+    return None
+
+CLIPBOARD_CMD = get_clipboard_cmd()
+
+def copy_to_clipboard(text):
+    if not CLIPBOARD_CMD or not text:
+        return False
+    try:
+        proc = subprocess.Popen(CLIPBOARD_CMD, shell=True, stdin=subprocess.PIPE)
+        proc.communicate(input=text.encode("utf-8"))
+        return True
+    except Exception:
+        return False
+
+
+# --- API Operations ---
+
+def api_request(path, method="GET", data=None):
+    url = f"{SINGBOX_API}/{path.lstrip('/')}"
+    headers = {}
+    if SINGBOX_SECRET:
+        headers["Authorization"] = f"Bearer {SINGBOX_SECRET}"
+
+    body = json.dumps(data).encode("utf-8") if data is not None else None
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+
+    req = urllib.request.Request(url, headers=headers, method=method, data=body)
+    try:
+        with urllib.request.urlopen(req, timeout=1) as resp:
+            if resp.status == 200:
+                b = resp.read().decode("utf-8")
+                return json.loads(b) if b else {}
+            elif resp.status == 204:
+                return True
+    except Exception:
+        return None
+    return None
+
+
+# --- Background Proxy Cacher ---
+
+def background_proxy_fetcher():
+    global CACHED_PROXY_NODES, CACHED_CURRENT_NODE
+    while True:
+        resp_data = api_request(f"proxies/{PROXY_GROUP}")
+        if resp_data:
+            with PROXY_CACHE_LOCK:
+                CACHED_CURRENT_NODE = resp_data.get("now", "")
+                CACHED_PROXY_NODES = resp_data.get("all", [])
+        time.sleep(5)
+
+
+# --- Async IP Info & AbuseIPDB Fetching ---
+
+def fetch_country_worker(ip):
+    cache_file = os.path.join(CACHE_DIR, ip)
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, "r") as f:
+                IP_COUNTRY_CACHE[ip] = f.read().strip()
+            return
+        except Exception:
+            pass
+
+    try:
+        url = f"https://ipinfo.io/{ip}/country"
+        req = urllib.request.Request(url, headers={"User-Agent": "curl/7.68.0"})
+        with urllib.request.urlopen(req, timeout=1.5) as resp:
+            country = resp.read().decode("utf-8").strip() or "UNKNOWN"
+            IP_COUNTRY_CACHE[ip] = country
+            with open(cache_file, "w") as f:
+                f.write(country)
+    except Exception:
+        IP_COUNTRY_CACHE[ip] = "UNKNOWN"
+
+def get_ip_country_async(ip):
+    if not ip or ip in ["-", "127.0.0.1", "::1"] or ip in IP_COUNTRY_CACHE:
+        return
+    threading.Thread(target=fetch_country_worker, args=(ip,), daemon=True).start()
+
+
+def fetch_abuse_data(ip):
+    if not ip or ip in ["-", "127.0.0.1", "::1"]:
+        return {"ip": ip or "-", "error": "Invalid / Local Target"}
+
+    if not ABUSEIPDB_API_KEY:
+        return {"ip": ip, "error": "API Key Not Set"}
+
+    if ip in ABUSE_CACHE and isinstance(ABUSE_CACHE[ip], dict):
+        return ABUSE_CACHE[ip]
+
+    try:
+        url = f"https://api.abuseipdb.com/api/v2/check?ipAddress={urllib.parse.quote(ip)}"
+        req = urllib.request.Request(
+            url,
+            headers={"Key": ABUSEIPDB_API_KEY, "Accept": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=2.5) as resp:
+            data = json.loads(resp.read().decode("utf-8")).get("data", {})
+            res = {
+                "ip": ip,
+                "score": data.get("abuseConfidenceScore", "0"),
+                "reports": data.get("totalReports", 0),
+                "country": data.get("countryCode", "-"),
+                "domain": data.get("domain", "-"),
+                "isp": data.get("isp", "-"),
+                "usageType": data.get("usageType", "-"),
+                "whitelisted": data.get("isWhitelisted", False),
+                "error": None,
+            }
+            ABUSE_CACHE[ip] = res
+            return res
+    except Exception as e:
+        return {"ip": ip, "error": str(e)}
+
+
+def query_abuseipdb_single(ip, target_label):
+    global ABUSE_STATUS_MSG
+    if not ABUSEIPDB_API_KEY:
+        ABUSE_STATUS_MSG = "AbuseIPDB API Key Not Set"
+        return
+    if not ip or ip == "-":
+        ABUSE_STATUS_MSG = f"Invalid {target_label}"
+        return
+
+    ABUSE_STATUS_MSG = f"Querying AbuseIPDB for {target_label} ({ip})..."
+
+    def worker():
+        global ABUSE_STATUS_MSG
+        data = fetch_abuse_data(ip)
+        if data.get("error"):
+            ABUSE_STATUS_MSG = f"AbuseIPDB Error: {data['error']}"
+        else:
+            msg = f"{ip}  {data['country']}  {data['isp']}  {data['domain']}  {data['score']}%  {data['reports']}"
+            ABUSE_STATUS_MSG = msg
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def open_abuse_modal(dip):
+    global MODAL_DATA
+    with MODAL_LOCK:
+        MODAL_DATA = {
+            "dip": dip,
+            "d_data": {"ip": dip, "loading": True},
+        }
+
+    def worker():
+        d_res = fetch_abuse_data(dip)
+        with MODAL_LOCK:
+            if MODAL_DATA:
+                MODAL_DATA["d_data"] = d_res
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+# --- Formatting Helpers ---
+
+def fmt_bytes(size):
+    try:
+        b = float(size)
+    except (ValueError, TypeError):
+        return "0 B"
+
+    if b >= 1073741824:
+        return f"{b / 1073741824:.1f} G"
+    elif b >= 1048576:
+        return f"{b / 1048576:.1f} M"
+    elif b >= 1024:
+        return f"{b / 1024:.1f} K"
+    return f"{int(b)} B"
+
+def clean_path(p):
+    if not p:
+        return "-"
+    p_str = str(p).split("/")[-1].split()[0]
+    return p_str if p_str else "-"
+
+def parse_time(t):
+    if not t:
+        return " "
+    t_str = str(t)
+    return t_str.split("T")[1][:8] if "T" in t_str else " "
+
+
+# --- Process Connections Data ---
+
+def process_connections_payload(raw_conns):
+    global LATEST_CONNECTIONS, API_ERROR, SCROLL_OFFSET, SELECTED_ROW, AUTO_FOLLOW_MODE, SELECTED_CONN_ID, CONNECTION_HISTORY
+
+    filtered = [
+        c for c in raw_conns
+        if str(c.get("metadata", {}).get("destinationPort", "")) != "444"
+    ]
+
+    active_ids = set()
+    now = time.time()
+
+    with CONNECTIONS_LOCK:
+        for c in filtered:
+            cid = c.get("id")
+            if cid:
+                active_ids.add(cid)
+                CONNECTION_HISTORY[cid] = {"data": c, "closed_at": None}
+
+        expired_ids = []
+        for cid, info in list(CONNECTION_HISTORY.items()):
+            if cid not in active_ids:
+                if info["closed_at"] is None:
+                    info["closed_at"] = now
+                elif now - info["closed_at"] > 10:
+                    expired_ids.append(cid)
+
+        for cid in expired_ids:
+            del CONNECTION_HISTORY[cid]
+
+        all_tracked = []
+        for cid, info in CONNECTION_HISTORY.items():
+            item_copy = dict(info["data"])
+            item_copy["_is_closed"] = (info["closed_at"] is not None)
+            all_tracked.append(item_copy)
+
+    if FILTER_QUERY:
+        fq = FILTER_QUERY.lower()
+        res = []
+        for c in all_tracked:
+            meta = c.get("metadata", {})
+            chains = c.get("chains", [])
+            chain_str = chains[0] if chains else ""
+
+            match = (
+                fq in clean_path(meta.get("type", "")).lower()
+                or fq in clean_path(meta.get("host", "")).lower()
+                or fq in str(meta.get("destinationIP", "")).lower()
+                or fq in clean_path(meta.get("processPath", "")).lower()
+                or fq in chain_str.lower()
+            )
+            if match:
+                res.append(c)
+        all_tracked = res
+
+    groups = {}
+    for c in all_tracked:
+        meta = c.get("metadata", {})
+        key = (
+            meta.get("type"),
+            meta.get("sourceIP"),
+            meta.get("destinationIP"),
+            meta.get("destinationPort"),
+            meta.get("host"),
+        )
+        groups.setdefault(key, []).append(c)
+
+    processed = []
+    for key, items in groups.items():
+        first = dict(items[0])
+        try:
+            upload = int(first.get("upload", 0))
+        except (ValueError, TypeError):
+            upload = 0
+        try:
+            download = int(first.get("download", 0))
+        except (ValueError, TypeError):
+            download = 0
+
+        first["count"] = str(len(items))
+        first["upload"] = upload
+        first["download"] = download
+        first["_is_closed"] = all(item.get("_is_closed", False) for item in items)
+        processed.append(first)
+
+    if SORT_BY == "upload":
+        processed.sort(key=lambda x: x["upload"], reverse=True)
+    elif SORT_BY == "download":
+        processed.sort(key=lambda x: x["download"], reverse=True)
+    elif SORT_BY == "end":
+        processed.sort(key=lambda x: x.get("start", ""), reverse=True)
+    else:
+        processed.sort(key=lambda x: x.get("start", ""))
+
+    if CHECK_RU_IPS:
+        for c in processed:
+            dip = c.get("metadata", {}).get("destinationIP")
+            if dip:
+                get_ip_country_async(dip)
+
+    with CONNECTIONS_LOCK:
+        new_len = len(processed)
+
+        if AUTO_FOLLOW_MODE == "top":
+            SCROLL_OFFSET = 0
+            if SELECTED_ROW == 0:
+                SELECTED_ROW = 0
+                if processed:
+                    SELECTED_CONN_ID = processed[0].get("id")
+            elif SELECTED_CONN_ID and processed:
+                found_index = None
+                for idx, item in enumerate(processed):
+                    if item.get("id") == SELECTED_CONN_ID:
+                        found_index = idx
+                        break
+                if found_index is not None:
+                    SELECTED_ROW = found_index
+                else:
+                    SELECTED_ROW = min(SELECTED_ROW, new_len - 1)
+                    if new_len > 0:
+                        SELECTED_CONN_ID = processed[SELECTED_ROW].get("id")
+        elif AUTO_FOLLOW_MODE == "bottom" and new_len > 0 and SORT_BY == "start":
+            SELECTED_ROW = new_len - 1
+            SELECTED_CONN_ID = processed[-1].get("id")
+        elif SELECTED_CONN_ID and processed:
+            found_index = None
+            for idx, item in enumerate(processed):
+                if item.get("id") == SELECTED_CONN_ID:
+                    found_index = idx
+                    break
+
+            if found_index is not None:
+                SELECTED_ROW = found_index
+            else:
+                SELECTED_ROW = min(SELECTED_ROW, new_len - 1)
+                SELECTED_CONN_ID = processed[SELECTED_ROW].get("id") if new_len > 0 else None
+
+        LATEST_CONNECTIONS = processed
+        API_ERROR = None
+
+
+# --- Background WebSocket Listener Loop ---
+
+def background_websocket_loop():
+    global API_ERROR
+
+    raw_api = SINGBOX_API.strip()
+    if not raw_api.startswith(("http://", "https://", "ws://", "wss://")):
+        raw_api = "http://" + raw_api
+
+    parsed = urllib.parse.urlparse(raw_api)
+    host_port = parsed.netloc if parsed.netloc else parsed.path.split('/')[0]
+
+    scheme = "wss" if parsed.scheme in ["https", "wss"] else "ws"
+    ws_url = f"{scheme}://{host_port}/connections"
+
+    if SINGBOX_SECRET:
+        ws_url += f"?secret={urllib.parse.quote(SINGBOX_SECRET)}"
+
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Origin": f"http://{host_port}",
+    }
+    if SINGBOX_SECRET:
+        headers["Authorization"] = f"Bearer {SINGBOX_SECRET}"
+
+    while True:
+        try:
+            ws = websocket.create_connection(
+                ws_url,
+                header=headers,
+                timeout=5,
+                ping_interval=10,
+                ping_timeout=5
+            )
+            with CONNECTIONS_LOCK:
+                API_ERROR = None
+
+            while True:
+                if IS_PAUSED:
+                    time.sleep(0.2)
+                    continue
+
+                message = ws.recv()
+                if not message:
+                    break
+
+                data = json.loads(message)
+                if "connections" in data and isinstance(data["connections"], list):
+                    process_connections_payload(data["connections"])
+
+        except websocket.WebSocketBadStatusException as e:
+            with CONNECTIONS_LOCK:
+                API_ERROR = f"✗ sing-box WS Rejected (HTTP {e.status_code})"
+            time.sleep(2)
+        except Exception as e:
+            with CONNECTIONS_LOCK:
+                API_ERROR = f"✗ WS Error ({type(e).__name__}: {str(e)})"
+            time.sleep(2)
+
+
+# --- Robust Curses Input Dialog ---
+
+def curses_prompt(stdscr, prompt_symbol):
+    h, w = stdscr.getmaxyx()
+
+    stdscr.nodelay(False)
+    curses.echo()
+    curses.curs_set(1)
+
+    stdscr.move(h - 1, 0)
+    stdscr.clrtoeol()
+    stdscr.addstr(h - 1, 0, f"{prompt_symbol} ", curses.color_pair(3) | curses.A_BOLD)
+    stdscr.refresh()
+
+    try:
+        input_bytes = stdscr.getstr(h - 1, len(prompt_symbol) + 1)
+        val = input_bytes.decode("utf-8").strip()
+    except Exception:
+        val = ""
+
+    curses.noecho()
+    curses.curs_set(0)
+    stdscr.nodelay(True)
+    return val
+
+
+# --- Modal Window Overlay ---
+
+def draw_modal_overlay(stdscr):
+    global MODAL_WIN
+    with MODAL_LOCK:
+        if not MODAL_DATA:
+            MODAL_WIN = None
+            return
+        modal_copy = dict(MODAL_DATA)
+
+    h, w = stdscr.getmaxyx()
+    box_h = min(12, h - 4)
+    box_w = min(76, w - 4)
+    if box_h < 6 or box_w < 30:
+        return
+
+    start_y = (h - box_h) // 2
+    start_x = (w - box_w) // 2
+
+    try:
+        if MODAL_WIN is None:
+            MODAL_WIN = curses.newwin(box_h, box_w, start_y, start_x)
+
+        MODAL_WIN.erase()
+        MODAL_WIN.attron(curses.color_pair(3) | curses.A_BOLD)
+        MODAL_WIN.box()
+        MODAL_WIN.addstr(0, 2, " AbuseIPDB Connection Details ", curses.color_pair(3) | curses.A_BOLD)
+        MODAL_WIN.attroff(curses.color_pair(3) | curses.A_BOLD)
+
+        def draw_ip_block(y_offset, title, data):
+            MODAL_WIN.addstr(y_offset, 2, f"{title} {data.get('country', '-')} {data.get('ip', '-')} {data.get('score', '0')}%  {data.get('reports', 0)}", curses.color_pair(5) | curses.A_BOLD)
+            if data.get("loading"):
+                MODAL_WIN.addstr(y_offset + 1, 4, "Fetching threat intelligence...", curses.A_BOLD)
+            elif data.get("error"):
+                MODAL_WIN.addstr(y_offset + 1, 4, f"Error: {data['error']}", curses.color_pair(1) | curses.A_BOLD)
+            else:
+                MODAL_WIN.addstr(y_offset + 2, 4, f"{data.get('isp', '-')[:box_w - 10]}", curses.A_BOLD)
+                MODAL_WIN.addstr(y_offset + 3, 4, f"{data.get('domain', '-')}  {data.get('usageType', '-')}", curses.A_BOLD)
+
+        draw_ip_block(2, " ", modal_copy.get("d_data", {}))
+
+        MODAL_WIN.refresh()
+    except curses.error:
+        pass
+
+
+# --- Native Proxy Selector Renderer ---
+
+def draw_proxy_selector_interface(stdscr):
+    global PROXY_SELECTED_ROW
+
+    h, w = stdscr.getmaxyx()
+    max_visible_rows = max(1, h)
+
+    with PROXY_CACHE_LOCK:
+        nodes = list(CACHED_PROXY_NODES)
+        current = CACHED_CURRENT_NODE
+
+    if not nodes:
+        try:
+            stdscr.addstr(0, 0, "No available nodes cached yet.", curses.color_pair(1) | curses.A_BOLD)
+        except curses.error:
+            pass
+        return
+
+    if PROXY_SELECTED_ROW >= len(nodes):
+        PROXY_SELECTED_ROW = max(0, len(nodes) - 1)
+
+    start_idx = max(0, PROXY_SELECTED_ROW - max_visible_rows + 1)
+    end_idx = min(len(nodes), start_idx + max_visible_rows)
+
+    for screen_y, idx in enumerate(range(start_idx, end_idx), start=0):
+        node = nodes[idx]
+        is_active = (node == current)
+        is_selected = (idx == PROXY_SELECTED_ROW)
+
+        if is_active:
+            prefix = "● "
+            active_node_color = curses.color_pair(2) | curses.A_BOLD  # #47af13 for active indicator dot
+        else:
+            prefix = "  "
+            active_node_color = curses.color_pair(0) | curses.A_BOLD
+
+        line_str = f"{prefix}{node}"
+
+        if is_selected:
+            cell_style = curses.color_pair(6) | curses.A_BOLD  # Selection bar
+        else:
+            if is_active:
+                cell_style = active_node_color
+            else:
+                cell_style = curses.color_pair(3) | curses.A_BOLD
+
+        chunk = line_str[:w]
+        try:
+            if is_selected:
+                stdscr.addstr(screen_y, 0, chunk, cell_style)
+                curr_len = len(chunk)
+                if curr_len < w:
+                    trailing_len = w - curr_len
+                    if curr_len + trailing_len >= w:
+                        stdscr.addstr(screen_y, curr_len, " " * (trailing_len - 1), cell_style)
+                        stdscr.insch(screen_y, w - 1, ord(" "), cell_style)
+                    else:
+                        stdscr.addstr(screen_y, curr_len, " " * trailing_len, cell_style)
+            else:
+                stdscr.addstr(screen_y, 0, chunk.ljust(w), cell_style)
+        except curses.error:
+            pass
+
+
+# --- UI Renderer ---
+
+def draw_main_interface(stdscr):
+    global SELECTED_ROW, SCROLL_OFFSET, AUTO_FOLLOW_MODE
+
+    h, w = stdscr.getmaxyx()
+    max_visible_rows = max(1, h - 2)
+
+    with CONNECTIONS_LOCK:
+        conns = list(LATEST_CONNECTIONS)
+        err = API_ERROR
+
+    if err:
+        stdscr.addstr(0, 0, err, curses.color_pair(1) | curses.A_BOLD)
+        return
+
+    if not conns:
+        stdscr.addstr(0, 0, "No active connections.", curses.color_pair(3) | curses.A_BOLD)
+
+    if SELECTED_ROW >= len(conns):
+        SELECTED_ROW = max(0, len(conns) - 1)
+
+    if AUTO_FOLLOW_MODE == "bottom" and len(conns) > 0 and SORT_BY == "start":
+        SCROLL_OFFSET = max(0, len(conns) - max_visible_rows)
+    else:
+        if SELECTED_ROW < SCROLL_OFFSET:
+            SCROLL_OFFSET = SELECTED_ROW
+        elif SELECTED_ROW >= SCROLL_OFFSET + max_visible_rows:
+            SCROLL_OFFSET = SELECTED_ROW - max_visible_rows + 1
+
+    if SCROLL_OFFSET == 0 and AUTO_FOLLOW_MODE != "bottom":
+        AUTO_FOLLOW_MODE = "top"
+    elif SCROLL_OFFSET > 0 and AUTO_FOLLOW_MODE == "top":
+        AUTO_FOLLOW_MODE = "none"
+
+    table_data = []
+    for i, c in enumerate(conns):
+        meta = c.get("metadata", {})
+        chains = c.get("chains", [])
+        first_chain = chains[0] if chains else "-"
+
+        table_data.append({
+            "chain": first_chain[0] if first_chain else "-",
+            "proc": clean_path(meta.get("processPath")),
+            "dip": str(meta.get("destinationIP") or "-"),
+            "host": str(meta.get("host") or "-"),
+            "dport": str(meta.get("destinationPort") or "-"),
+            "up": fmt_bytes(c.get("upload", 0)),
+            "down": fmt_bytes(c.get("download", 0)),
+            "time": parse_time(c.get("start")),
+            "raw_up": c.get("upload", 0),
+            "raw_down": c.get("download", 0),
+            "raw_dip": str(meta.get("destinationIP") or "-"),
+            "raw_is_closed": c.get("_is_closed", False),
+        })
+
+    cols = ["chain", "proc", "dip", "host", "dport", "up", "down", "time"]
+    col_widths = {k: len(k) for k in cols}
+    for row in table_data:
+        for k in cols:
+            if k == "chain":
+                col_widths[k] = 1
+            else:
+                col_widths[k] = max(col_widths[k], len(row[k]))
+
+    visible_rows = table_data[SCROLL_OFFSET : SCROLL_OFFSET + max_visible_rows]
+
+    for screen_y, row in enumerate(visible_rows):
+        actual_idx = SCROLL_OFFSET + screen_y
+
+        is_ru = IP_COUNTRY_CACHE.get(row["raw_dip"]) == "RU"
+        is_dead = row["raw_up"] == 0 or row["raw_down"] == 0
+        is_closed = row["raw_is_closed"]
+
+        row_color = curses.color_pair(0)
+        if is_ru:
+            row_color = curses.color_pair(4)
+        elif is_dead:
+            row_color = curses.color_pair(1)
+        elif is_closed:
+            row_color = curses.color_pair(9)  # Bright black (dark gray) for closed connections
+
+        is_selected = (actual_idx == SELECTED_ROW)
+
+        col_values = [
+            row["chain"][:1],
+            row["proc"].ljust(col_widths["proc"]),
+            row["dip"].ljust(col_widths["dip"]),
+            row["host"].ljust(col_widths["host"]),
+            row["dport"].rjust(col_widths["dport"]),
+            row["up"].rjust(col_widths["up"]),
+            row["down"].rjust(col_widths["down"]),
+            row["time"].ljust(col_widths["time"]),
+        ]
+
+        curr_x = 0
+        for col_idx, col_str in enumerate(col_values):
+            if curr_x >= w:
+                break
+
+            if is_selected:
+                selected_pair = curses.color_pair(7) if is_dead else curses.color_pair(6)
+                cell_style = selected_pair | curses.A_BOLD
+            else:
+                if col_idx == 0:
+                    cell_style = curses.color_pair(3) | curses.A_BOLD  # Magenta (#ff8700)
+                elif col_idx == 1:
+                    cell_style = row_color | curses.A_BOLD
+                elif col_idx in (2, 3):
+                    if row["raw_down"] == 0:
+                        col_color = curses.color_pair(1)
+                    elif is_ru:
+                        col_color = curses.color_pair(4)
+                    elif is_closed:
+                        col_color = curses.color_pair(2)  # Bright green (#47af13) for closed IP/host
+                    else:
+                        col_color = curses.color_pair(2)
+                    cell_style = col_color | curses.A_BOLD
+                else:
+                    cell_style = row_color | curses.A_BOLD
+
+            chunk = col_str[: w - curr_x]
+            try:
+                stdscr.addstr(screen_y, curr_x, chunk, cell_style)
+            except curses.error:
+                pass
+
+            curr_x += len(chunk)
+
+            if col_idx < len(col_values) - 1 and curr_x < w:
+                sep_width = 1 if col_idx == 0 else 2
+                sep = (" " * sep_width)[: w - curr_x]
+
+                if is_selected:
+                    selected_pair = curses.color_pair(7) if is_dead else curses.color_pair(6)
+                    sep_style = selected_pair | curses.A_BOLD
+                elif col_idx == 0:
+                    sep_style = curses.color_pair(3) | curses.A_BOLD
+                else:
+                    sep_style = row_color | curses.A_BOLD
+
+                try:
+                    stdscr.addstr(screen_y, curr_x, sep, sep_style)
+                except curses.error:
+                    pass
+                curr_x += len(sep)
+
+        if is_selected and curr_x < w:
+            trailing_len = w - curr_x
+            selected_pair = curses.color_pair(7) if is_dead else curses.color_pair(6)
+            try:
+                if curr_x + trailing_len >= w:
+                    stdscr.addstr(screen_y, curr_x, " " * (trailing_len - 1), selected_pair | curses.A_BOLD)
+                    stdscr.insch(screen_y, w - 1, ord(" "), selected_pair | curses.A_BOLD)
+                else:
+                    stdscr.addstr(screen_y, curr_x, " " * trailing_len, selected_pair | curses.A_BOLD)
+            except curses.error:
+                pass
+
+    sort_icon = ""
+    if SORT_BY == "download":
+        sort_icon = ""
+    elif SORT_BY == "upload":
+        sort_icon = ""
+    elif SORT_BY == "end":
+        sort_icon = ""
+
+    status_parts = []
+    if IS_PAUSED == True:
+        status_parts.append("")
+    elif IS_PAUSED == False:
+        status_parts.append("")
+    if AUTO_FOLLOW_MODE == "bottom" and SORT_BY == "start":
+        status_parts.append("")
+    elif AUTO_FOLLOW_MODE == "top":
+        status_parts.append("")
+
+    if sort_icon:
+        status_parts.append(sort_icon)
+
+    with PROXY_CACHE_LOCK:
+        if CACHED_CURRENT_NODE:
+            status_parts.append(f"{CACHED_CURRENT_NODE}")
+
+    if FILTER_QUERY:
+        status_parts.append(f" {FILTER_QUERY}")
+    if CHECK_RU_IPS:
+        status_parts.append("󰰟")
+    if ABUSE_STATUS_MSG:
+        status_parts.append(ABUSE_STATUS_MSG)
+
+    status_line = " ".join(status_parts)
+
+    current_pos = (SELECTED_ROW + 1) if conns else 0
+    scroll_pct = f"{current_pos}/{len(conns)}"
+
+    try:
+        stdscr.move(h - 1, 0)
+        stdscr.clrtoeol()
+
+        if status_line:
+            stdscr.addstr(h - 1, 0, status_line[: w - len(scroll_pct) - 2], curses.color_pair(3) | curses.A_BOLD)
+
+        right_x = max(0, w - len(scroll_pct) - 1)
+        stdscr.addstr(h - 1, right_x, scroll_pct, curses.color_pair(3) | curses.A_BOLD)
+
+    except curses.error:
+        pass
+
+def update_selection_id(conns):
+    global SELECTED_CONN_ID
+    if 0 <= SELECTED_ROW < len(conns):
+        SELECTED_CONN_ID = conns[SELECTED_ROW].get("id")
+
+def draw_ui(stdscr):
+    global SORT_BY, FILTER_QUERY, CHECK_RU_IPS, IS_PAUSED, ABUSE_STATUS_MSG
+    global SELECTED_ROW, SCROLL_OFFSET, MODAL_DATA, MODAL_WIN, AUTO_FOLLOW_MODE, SELECTED_CONN_ID
+    global IN_PROXY_SELECTOR, PROXY_SELECTED_ROW, CACHED_CURRENT_NODE, CACHED_PROXY_NODES
+
+    curses.use_default_colors()
+    curses.curs_set(0)
+    stdscr.nodelay(True)
+    stdscr.timeout(50)
+
+    curses.init_pair(1, curses.COLOR_RED, -1)
+    curses.init_pair(2, 70, -1)   # Green elements -> #47af13 (Xterm color 70)
+    curses.init_pair(3, 208, -1)  # Magenta elements -> #ff8700 (Xterm color 208)
+    curses.init_pair(4, curses.COLOR_BLUE, -1)
+    curses.init_pair(5, curses.COLOR_YELLOW, -1)
+    curses.init_pair(6, curses.COLOR_BLACK, 208)  # Normal selection bar background using #ff8700
+    curses.init_pair(7, curses.COLOR_BLACK, curses.COLOR_RED)
+    curses.init_pair(9, 8, -1)    # Bright black (dark gray) for closed connections -> Xterm color 8
+
+    # Start background threads
+    threading.Thread(target=background_websocket_loop, daemon=True).start()
+    threading.Thread(target=background_proxy_fetcher, daemon=True).start()
+
+    modal_active_last_frame = False
+
+    while True:
+        key = stdscr.getch()
+
+        # Handle Native Proxy Selector Mode Input
+        if IN_PROXY_SELECTOR:
+            with PROXY_CACHE_LOCK:
+                nodes = list(CACHED_PROXY_NODES)
+                current = CACHED_CURRENT_NODE
+
+            if key == 27:
+                stdscr.timeout(10)
+                next_key = stdscr.getch()
+                stdscr.timeout(50)
+                if next_key in [ord("q"), ord("Q")]:
+                    break  # Alt+q quits script even from proxy selector
+                elif next_key == -1:
+                    IN_PROXY_SELECTOR = False
+            elif key in [ord("q"), ord("Q")]:
+                IN_PROXY_SELECTOR = False
+            elif key == curses.KEY_UP:
+                if PROXY_SELECTED_ROW > 0:
+                    PROXY_SELECTED_ROW -= 1
+            elif key == curses.KEY_DOWN:
+                if PROXY_SELECTED_ROW < len(nodes) - 1:
+                    PROXY_SELECTED_ROW += 1
+            elif key in [curses.KEY_ENTER, 10, 13]:
+                if 0 <= PROXY_SELECTED_ROW < len(nodes):
+                    chosen_node = nodes[PROXY_SELECTED_ROW]
+                    switch_url = f"{SINGBOX_API}/proxies/{PROXY_GROUP}"
+                    headers = {"Authorization": f"Bearer {SINGBOX_SECRET}"} if SINGBOX_SECRET else {}
+                    headers["Content-Type"] = "application/json"
+                    data_bytes = json.dumps({"name": chosen_node}).encode("utf-8")
+
+                    try:
+                        req = urllib.request.Request(switch_url, headers=headers, method="PUT", data=data_bytes)
+                        with urllib.request.urlopen(req, timeout=2) as resp:
+                            if resp.status in (200, 204):
+                                with PROXY_CACHE_LOCK:
+                                    CACHED_CURRENT_NODE = chosen_node
+                            else:
+                                ABUSE_STATUS_MSG = f"Failed to switch. Status {resp.status}"
+                    except Exception as e:
+                        ABUSE_STATUS_MSG = f"Switch error: {str(e)}"
+                IN_PROXY_SELECTOR = False
+
+            stdscr.erase()
+            draw_proxy_selector_interface(stdscr)
+            stdscr.refresh()
+            continue
+
+        with MODAL_LOCK:
+            has_modal = MODAL_DATA is not None
+
+        if has_modal:
+            if not modal_active_last_frame:
+                stdscr.erase()
+                draw_main_interface(stdscr)
+                stdscr.refresh()
+                modal_active_last_frame = True
+
+            if key in [27, ord("q"), ord("Q"), curses.KEY_ENTER, 10, 13]:
+                with MODAL_LOCK:
+                    MODAL_DATA = None
+                    MODAL_WIN = None
+                modal_active_last_frame = False
+                stdscr.erase()
+                draw_main_interface(stdscr)
+                stdscr.refresh()
+                continue
+
+            draw_modal_overlay(stdscr)
+            continue
+
+        modal_active_last_frame = False
+
+        with CONNECTIONS_LOCK:
+            conns = list(LATEST_CONNECTIONS)
+
+        if key in [ord("q"), ord("Q")]:
+            break
+        # Instant Escape key toggle or Alt+q quit
+        elif key == 27:
+            stdscr.timeout(10)
+            next_key = stdscr.getch()
+            stdscr.timeout(50)
+
+            if next_key in [ord("q"), ord("Q")]:
+                break  # Alt+q quits script
+            elif next_key == -1:
+                with PROXY_CACHE_LOCK:
+                    nodes = list(CACHED_PROXY_NODES)
+                    current = CACHED_CURRENT_NODE
+                if nodes:
+                    PROXY_SELECTED_ROW = 0
+                    if current in nodes:
+                        PROXY_SELECTED_ROW = nodes.index(current)
+                    IN_PROXY_SELECTOR = True
+                else:
+                    ABUSE_STATUS_MSG = "Proxy cache warming up, please try again."
+        elif key in [ord("p"), ord("P"), ord(" ")]:
+            IS_PAUSED = not IS_PAUSED
+        elif key in [ord("r"), ord("R")]:
+            CHECK_RU_IPS = not CHECK_RU_IPS
+        elif key in [ord("s"), ord("S")]:
+            if SORT_BY == "start":
+                SORT_BY = "end"
+            elif SORT_BY == "end":
+                SORT_BY = "upload"
+            elif SORT_BY == "upload":
+                SORT_BY = "download"
+            else:
+                SORT_BY = "start"
+
+            if SORT_BY != "start" and AUTO_FOLLOW_MODE == "bottom":
+                AUTO_FOLLOW_MODE = "none"
+
+            update_selection_id(conns)
+        elif key in [ord("x"), ord("X")]:
+            FILTER_QUERY = ""
+            ABUSE_STATUS_MSG = ""
+
+        elif key == curses.KEY_UP:
+            if SELECTED_ROW > 0:
+                SELECTED_ROW -= 1
+            update_selection_id(conns)
+        elif key == curses.KEY_DOWN:
+            if SELECTED_ROW < len(conns) - 1:
+                SELECTED_ROW += 1
+                if SELECTED_ROW == len(conns) - 1 and SORT_BY == "start":
+                    AUTO_FOLLOW_MODE = "bottom"
+            elif SORT_BY == "start":
+                AUTO_FOLLOW_MODE = "bottom"
+            update_selection_id(conns)
+        elif key in [curses.KEY_HOME, ord("g")]:
+            SELECTED_ROW = 0
+            SCROLL_OFFSET = 0
+            AUTO_FOLLOW_MODE = "top"
+            update_selection_id(conns)
+        elif key in [curses.KEY_END, ord("G"), curses.KEY_NPAGE]:
+            if conns:
+                SELECTED_ROW = len(conns) - 1
+                if SORT_BY == "start":
+                    AUTO_FOLLOW_MODE = "bottom"
+                update_selection_id(conns)
+        elif key == curses.KEY_PPAGE:
+            SELECTED_ROW = max(0, SELECTED_ROW - 10)
+            update_selection_id(conns)
+
+        elif key in [curses.KEY_ENTER, 10, 13]:
+            if 0 <= SELECTED_ROW < len(conns):
+                meta = conns[SELECTED_ROW].get("metadata", {})
+                dip = meta.get("destinationIP") or meta.get("host")
+                open_abuse_modal(dip)
+
+        elif key in [ord("f"), ord("F")]:
+            FILTER_QUERY = curses_prompt(stdscr, "")
+            update_selection_id(conns)
+
+        elif key in [ord("k"), ord("K")]:
+            if 0 <= SELECTED_ROW < len(conns):
+                conn_id = conns[SELECTED_ROW].get("id")
+                if conn_id:
+                    threading.Thread(
+                        target=api_request,
+                        args=(f"connections/{conn_id}", "DELETE"),
+                        daemon=True,
+                    ).start()
+                    ABUSE_STATUS_MSG = f"Killed connection #{SELECTED_ROW + 1}"
+        elif key in [ord("i"), ord("I")]:
+            if 0 <= SELECTED_ROW < len(conns):
+                meta = conns[SELECTED_ROW].get("metadata", {})
+                target = meta.get("destinationIP") or meta.get("host")
+                query_abuseipdb_single(target, "Destination")
+        elif key == ord("c"):
+            if 0 <= SELECTED_ROW < len(conns):
+                meta = conns[SELECTED_ROW].get("metadata", {})
+                target = meta.get("destinationIP") or meta.get("host")
+                ABUSE_STATUS_MSG = f"Copied {target}" if copy_to_clipboard(target) else "Clipboard failed"
+        elif key in [ord("d"), ord("D")]:
+            if 0 <= SELECTED_ROW < len(conns):
+                meta = conns[SELECTED_ROW].get("metadata", {})
+                domain = meta.get("host")
+                if domain and domain != "-":
+                    ABUSE_STATUS_MSG = f"Copied domain {domain}" if copy_to_clipboard(domain) else "Clipboard failed"
+                else:
+                    ABUSE_STATUS_MSG = "No domain to copy"
+
+        stdscr.erase()
+        draw_main_interface(stdscr)
+        stdscr.refresh()
+
+
+def main():
+    set_terminal_title(TAB_NAME)
+    try:
+        curses.wrapper(draw_ui)
+    except KeyboardInterrupt:
+        sys.exit(0)
+
+if __name__ == "__main__":
+    main()
