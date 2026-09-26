@@ -31,7 +31,7 @@ A TUI panel for [Sing-Box](https://github.com/SagerNet/sing-box)’s API calls u
 - <b>K</b>  Kills selected connection
 - <b>C</b>  Copies outgoing IP
 - <b>D</b>  Copies domain name
-- <b>S</b>  Changes sort order
+- <b>S</b>  Changes sort direction and sort order by most uploaded or downloaded.
 
 #### Information
 All settings, API address and keys can be set directly in the Python code.
