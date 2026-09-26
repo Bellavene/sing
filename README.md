@@ -9,15 +9,15 @@ A TUI panel for [Sing-Box](https://github.com/SagerNet/sing-box)’s API calls u
 
   1. Visually pleasant minimal design.
   2. Highlights problematic connections and outgoing IP’s to specific country code.
-  3. AbuseIPDB API integration to fetch and cache instantly additional information about all IP’s
-  4. A simple GEO tracking system for outgoing IP’s based on cached AbuseIPDB queries.
+  3. AbuseIPDB API integration to instantly fetch and cache additional information about all outbound and inbound IP’s
+  4. A simple catching system for outgoing IP’s based on cached AbuseIPDB queries by country code.
 
 #### Shortcuts for the server version
 
 - <b>Enter</b>  Shows a popup with queried information about incomming and outgoing IP
 - <b>Escape</b>  Toggles Catch list
 - <b>Tab</b>  Adds current selection to Catch list
-- <b>R</b>  Toggles catching of outgoing connections by country code into the Catch list. (Default RU)
+- <b>R</b>  Toggles catching of outgoing connections by country code. (Default RU)
 - <b>K</b>  Kills selected connection
 - <b>C</b>  Copies outgoing IP
 - <b>Shift+C</b>  Copies incomming IP
