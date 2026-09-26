@@ -11,27 +11,25 @@ A TUI panel to directly talk to [Sing-Box](https://github.com/SagerNet/sing-box)
   2. AbuseIPDB API integration to fetch and cache instantly additional information about all IP’s
   3. A simple GEO tracking system for outgoing IP’s based on cached AbuseIPDB queries.
 
-# Shortcuts
+## Shortcuts for the server version
 
-## Server version
+- Enter  Shows a popup with queried information about incomming and outgoing IP
+- Escape  Toggles Catch list
+- Tab  Adds current selection to Catch list
+- R  Toggles catching of outgoing connections by country code into the Catch list. (Default RU)
+- K  Kills selected connection
+- C  Copies outgoing IP
+- Shift+C  Copies incomming IP
+- D  Copies domain name
+- S  Changes sort order
 
-<p>Enter  Shows a popup with queried information about incomming and outgoing IP
-Escape  Toggles Catch list
-Tab  Adds current selection to Catch list
-R  Toggles catching of outgoing connections by country code into the Catch list. (Default RU)
-K  Kills selected connection
-C  Copies outgoing IP
-Shift+C  Copies incomming IP
-D  Copies domain name
-S  Changes sort order</p>
+## Shortcuts for the client version
 
-## Client version
-
-<p>Enter  Shows a popup with queried information about outgoing IP
-K  Kills selected connection
-C  Copies outgoing IP
-D  Copies domain name
-S  Changes sort order</p>
+- Enter  Shows a popup with queried information about outgoing IP
+- K  Kills selected connection
+- C  Copies outgoing IP
+- D  Copies domain name
+- S  Changes sort order
 
 # Information
 All settings can be set directly in the Python code.
