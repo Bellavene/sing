@@ -14,7 +14,7 @@ A TUI panel for [Sing-Box](https://github.com/SagerNet/sing-box)’s API calls u
 
 #### Shortcuts for the server version
 
-- <b>Enter</b>  Shows a popup with queried information about incomming and outgoing IP
+- <b>Enter</b>  Shows a popup with queried information about selected connection
 - <b>Escape</b>  Toggles Catch list
 - <b>Tab</b>  Adds current selection to Catch list
 - <b>R</b>  Toggles catching of outgoing connections by country code. (Default RU)
