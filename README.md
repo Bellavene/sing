@@ -32,3 +32,7 @@ K — Kills selected connection
 C — Copies outgoing IP
 D — Copies domain name
 S — Changes sort order
+
+# Information
+All settings can be set directly in the Python code.
+Uses Hack Nerd Font for icons.
