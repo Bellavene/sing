@@ -1,4 +1,4 @@
-### sing
+# sing
 
 A TUI panel for [Sing-Box](https://github.com/SagerNet/sing-box)’s API calls using websocket connection for speed.
 
