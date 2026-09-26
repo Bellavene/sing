@@ -13,7 +13,7 @@ A TUI panel to directly talk to [Sing-Box](https://github.com/SagerNet/sing-box)
 
 ## Shortcuts for the server version
 
-- Enter  Shows a popup with queried information about incomming and outgoing IP
+- <b>Enter</b>  Shows a popup with queried information about incomming and outgoing IP
 - Escape  Toggles Catch list
 - Tab  Adds current selection to Catch list
 - R  Toggles catching of outgoing connections by country code into the Catch list. (Default RU)
