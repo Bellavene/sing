@@ -11,7 +11,7 @@ A TUI panel for [Sing-Box](https://github.com/SagerNet/sing-box)’s API calls u
   3. AbuseIPDB API integration to instantly fetch and cache additional information about all outbound and inbound IP’s
   4. A simple catching system for destination IP’s based on cached AbuseIPDB queries by country code.
 
-Seperate versions for sing-box running on a server or client client machine.
+Seperate versions for sing-box running on a server (sing) or local client machine (singlo)
 
 #### Sing
 <img width="1650" height="752" alt="Screenshot 2026-09-26 at 02 37 33 2" src="https://github.com/user-attachments/assets/a062d5d1-9325-4394-b30e-4a707cfba220" />
