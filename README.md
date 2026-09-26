@@ -26,6 +26,7 @@ A TUI panel to directly talk to [Sing-Box](https://github.com/SagerNet/sing-box)
 ## Shortcuts for the client version
 
 - <b>Enter</b>  Shows a popup with queried information about outgoing IP
+- <b>Escape</b>  Opens outbound proxy selector
 - <b>K</b>  Kills selected connection
 - <b>C</b>  Copies outgoing IP
 - <b>D</b>  Copies domain name
