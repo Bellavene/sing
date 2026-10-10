@@ -27,10 +27,10 @@ except ImportError:
 
 # Global Config / Defaults
 SINGBOX_API = os.environ.get("SINGBOX_API", "http://127.0.0.1:9090")
-SINGBOX_SECRET = os.environ.get("SINGBOX_SECRET", "SECRET")
+SINGBOX_SECRET = os.environ.get("SINGBOX_SECRET", "SEKRET")
 PROXY_GROUP = os.environ.get("SINGBOX_PROXY_GROUP", "Proxy")
-ABUSEIPDB_API_KEY = os.environ.get("ABUSEIPDB_API_KEY", "SECRET")
-TAB_NAME = os.environ.get("SINGBOX_TAB_NAME", "<b>Local</b>")  # Terminal Tab / Window Name
+IPINFO_API_KEY = os.environ.get("IPINFO_API_KEY", "")
+TAB_NAME = os.environ.get("SINGBOX_TAB_NAME", "SingLo")  # Terminal Tab / Window Name
 CACHE_DIR = "/tmp/singbox_script_cache"
 
 os.makedirs(CACHE_DIR, exist_ok=True)
@@ -38,9 +38,9 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 # State Variables
 SORT_BY = "end"  # "start", "end", "upload", "download"
 FILTER_QUERY = sys.argv[1] if len(sys.argv) > 1 else ""
-CHECK_RU_IPS = False
+CHECK_RU_IPS = False  # Controls live background fetches vs cache-only mode
 IS_PAUSED = False
-ABUSE_STATUS_MSG = ""
+IPINFO_STATUS_MSG = ""
 SELECTED_ROW = 0
 SELECTED_CONN_ID = None  # Unique connection tracker
 SCROLL_OFFSET = 0  # Offscreen scrolling line tracking
@@ -60,7 +60,7 @@ MODAL_WIN = None
 
 # In-Memory Cache & Async Data Store
 IP_COUNTRY_CACHE = {}
-ABUSE_CACHE = {}
+IPINFO_CACHE = {}
 CONNECTION_HISTORY = {}
 
 CONNECTIONS_LOCK = threading.Lock()
@@ -136,7 +136,7 @@ def background_proxy_fetcher():
         time.sleep(5)
 
 
-# --- Async IP Info & AbuseIPDB Fetching ---
+# --- Async IP Info & ipinfo.io Fetching ---
 
 def fetch_country_worker(ip):
     cache_file = os.path.join(CACHE_DIR, ip)
@@ -150,7 +150,10 @@ def fetch_country_worker(ip):
 
     try:
         url = f"https://ipinfo.io/{ip}/country"
-        req = urllib.request.Request(url, headers={"User-Agent": "curl/7.68.0"})
+        headers = {"User-Agent": "curl/7.68.0"}
+        if IPINFO_API_KEY:
+            headers["Authorization"] = f"Bearer {IPINFO_API_KEY}"
+        req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=1.5) as resp:
             country = resp.read().decode("utf-8").strip() or "UNKNOWN"
             IP_COUNTRY_CACHE[ip] = country
@@ -165,65 +168,67 @@ def get_ip_country_async(ip):
     threading.Thread(target=fetch_country_worker, args=(ip,), daemon=True).start()
 
 
-def fetch_abuse_data(ip):
+def fetch_ipinfo_data(ip, force=False):
+    global CHECK_RU_IPS
+
     if not ip or ip in ["-", "127.0.0.1", "::1"]:
         return {"ip": ip or "-", "error": "Invalid / Local Target"}
 
-    if not ABUSEIPDB_API_KEY:
-        return {"ip": ip, "error": "API Key Not Set"}
+    if ip in IPINFO_CACHE and isinstance(IPINFO_CACHE[ip], dict):
+        return IPINFO_CACHE[ip]
 
-    if ip in ABUSE_CACHE and isinstance(ABUSE_CACHE[ip], dict):
-        return ABUSE_CACHE[ip]
+    if not CHECK_RU_IPS and not force:
+        return {"ip": ip, "error": "ipinfo.io Disabled (Cache Only)"}
 
     try:
-        url = f"https://api.abuseipdb.com/api/v2/check?ipAddress={urllib.parse.quote(ip)}"
-        req = urllib.request.Request(
-            url,
-            headers={"Key": ABUSEIPDB_API_KEY, "Accept": "application/json"},
-        )
+        url = f"https://ipinfo.io/{urllib.parse.quote(ip)}/json"
+        headers = {"Accept": "application/json"}
+        if IPINFO_API_KEY:
+            headers["Authorization"] = f"Bearer {IPINFO_API_KEY}"
+
+        req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=2.5) as resp:
-            data = json.loads(resp.read().decode("utf-8")).get("data", {})
+            data = json.loads(resp.read().decode("utf-8"))
             res = {
-                "ip": ip,
-                "score": data.get("abuseConfidenceScore", "0"),
-                "reports": data.get("totalReports", 0),
-                "country": data.get("countryCode", "-"),
-                "domain": data.get("domain", "-"),
-                "isp": data.get("isp", "-"),
-                "usageType": data.get("usageType", "-"),
-                "whitelisted": data.get("isWhitelisted", False),
+                "ip": data.get("ip", ip),
+                "country": data.get("country", "-"),
+                "domain": data.get("hostname", "-"),
+                "isp": data.get("org", "-"),
+                "usageType": data.get("company", {}).get("type", "-") if isinstance(data.get("company"), dict) else "-",
                 "error": None,
             }
-            ABUSE_CACHE[ip] = res
+            IPINFO_CACHE[ip] = res
             return res
     except Exception as e:
-        return {"ip": ip, "error": str(e)}
+        error_msg = str(e)
+        if "HTTP Error 429" in error_msg:
+            CHECK_RU_IPS = False
+            return {"ip": ip, "error": "ipinfo.io Disabled (Rate Limited)"}
+        else:
+            return {"ip": ip, "error": error_msg}
 
 
-def query_abuseipdb_single(ip, target_label):
-    global ABUSE_STATUS_MSG
-    if not ABUSEIPDB_API_KEY:
-        ABUSE_STATUS_MSG = "AbuseIPDB API Key Not Set"
-        return
+def query_ipinfo_single(ip, target_label):
+    global IPINFO_STATUS_MSG
     if not ip or ip == "-":
-        ABUSE_STATUS_MSG = f"Invalid {target_label}"
+        IPINFO_STATUS_MSG = f"Invalid {target_label}"
         return
 
-    ABUSE_STATUS_MSG = f"Querying AbuseIPDB for {target_label} ({ip})..."
+    IPINFO_STATUS_MSG = f"Querying ipinfo.io for {target_label} ({ip})..."
 
     def worker():
-        global ABUSE_STATUS_MSG
-        data = fetch_abuse_data(ip)
+        global IPINFO_STATUS_MSG
+        data = fetch_ipinfo_data(ip, force=True)
         if data.get("error"):
-            ABUSE_STATUS_MSG = f"AbuseIPDB Error: {data['error']}"
+            IPINFO_STATUS_MSG = f"ipinfo.io Error: {data['error']}"
         else:
-            msg = f"{ip}  {data['country']}  {data['isp']}  {data['domain']}  {data['score']}%  {data['reports']}"
-            ABUSE_STATUS_MSG = msg
+            msg = f"{ip}  {data['country']}  {data['isp']}  {data['domain']}"
+            IPINFO_STATUS_MSG = msg
 
     threading.Thread(target=worker, daemon=True).start()
 
 
-def open_abuse_modal(dip):
+def open_ipinfo_modal(dip, force=False):
     global MODAL_DATA
     with MODAL_LOCK:
         MODAL_DATA = {
@@ -232,7 +237,7 @@ def open_abuse_modal(dip):
         }
 
     def worker():
-        d_res = fetch_abuse_data(dip)
+        d_res = fetch_ipinfo_data(dip, force=force)
         with MODAL_LOCK:
             if MODAL_DATA:
                 MODAL_DATA["d_data"] = d_res
@@ -523,13 +528,13 @@ def draw_modal_overlay(stdscr):
         MODAL_WIN.erase()
         MODAL_WIN.attron(curses.color_pair(3) | curses.A_BOLD)
         MODAL_WIN.box()
-        MODAL_WIN.addstr(0, 2, " AbuseIPDB Connection Details ", curses.color_pair(3) | curses.A_BOLD)
+        MODAL_WIN.addstr(0, 2, " ipinfo.io Connection Details ", curses.color_pair(3) | curses.A_BOLD)
         MODAL_WIN.attroff(curses.color_pair(3) | curses.A_BOLD)
 
         def draw_ip_block(y_offset, title, data):
-            MODAL_WIN.addstr(y_offset, 2, f"{title} {data.get('country', '-')} {data.get('ip', '-')} {data.get('score', '0')}%  {data.get('reports', 0)}", curses.color_pair(5) | curses.A_BOLD)
+            MODAL_WIN.addstr(y_offset, 2, f"{title} {data.get('country', '-')} {data.get('ip', '-')}", curses.color_pair(5) | curses.A_BOLD)
             if data.get("loading"):
-                MODAL_WIN.addstr(y_offset + 1, 4, "Fetching threat intelligence...", curses.A_BOLD)
+                MODAL_WIN.addstr(y_offset + 1, 4, "Fetching ipinfo.io intelligence...", curses.A_BOLD)
             elif data.get("error"):
                 MODAL_WIN.addstr(y_offset + 1, 4, f"Error: {data['error']}", curses.color_pair(1) | curses.A_BOLD)
             else:
@@ -796,8 +801,8 @@ def draw_main_interface(stdscr):
         status_parts.append(f" {FILTER_QUERY}")
     if CHECK_RU_IPS:
         status_parts.append("󰰟")
-    if ABUSE_STATUS_MSG:
-        status_parts.append(ABUSE_STATUS_MSG)
+    if IPINFO_STATUS_MSG:
+        status_parts.append(IPINFO_STATUS_MSG)
 
     status_line = " ".join(status_parts)
 
@@ -823,7 +828,7 @@ def update_selection_id(conns):
         SELECTED_CONN_ID = conns[SELECTED_ROW].get("id")
 
 def draw_ui(stdscr):
-    global SORT_BY, FILTER_QUERY, CHECK_RU_IPS, IS_PAUSED, ABUSE_STATUS_MSG
+    global SORT_BY, FILTER_QUERY, CHECK_RU_IPS, IS_PAUSED, IPINFO_STATUS_MSG
     global SELECTED_ROW, SCROLL_OFFSET, MODAL_DATA, MODAL_WIN, AUTO_FOLLOW_MODE, SELECTED_CONN_ID
     global IN_PROXY_SELECTOR, PROXY_SELECTED_ROW, CACHED_CURRENT_NODE, CACHED_PROXY_NODES
 
@@ -887,9 +892,9 @@ def draw_ui(stdscr):
                                 with PROXY_CACHE_LOCK:
                                     CACHED_CURRENT_NODE = chosen_node
                             else:
-                                ABUSE_STATUS_MSG = f"Failed to switch. Status {resp.status}"
+                                IPINFO_STATUS_MSG = f"Failed to switch. Status {resp.status}"
                     except Exception as e:
-                        ABUSE_STATUS_MSG = f"Switch error: {str(e)}"
+                        IPINFO_STATUS_MSG = f"Switch error: {str(e)}"
                 IN_PROXY_SELECTOR = False
 
             stdscr.erase()
@@ -945,7 +950,7 @@ def draw_ui(stdscr):
                         PROXY_SELECTED_ROW = nodes.index(current)
                     IN_PROXY_SELECTOR = True
                 else:
-                    ABUSE_STATUS_MSG = "Proxy cache warming up, please try again."
+                    IPINFO_STATUS_MSG = "Proxy cache warming up, please try again."
         elif key in [ord("p"), ord("P"), ord(" ")]:
             IS_PAUSED = not IS_PAUSED
         elif key in [ord("r"), ord("R")]:
@@ -966,7 +971,7 @@ def draw_ui(stdscr):
             update_selection_id(conns)
         elif key in [ord("x"), ord("X")]:
             FILTER_QUERY = ""
-            ABUSE_STATUS_MSG = ""
+            IPINFO_STATUS_MSG = ""
 
         elif key == curses.KEY_UP:
             if SELECTED_ROW > 0:
@@ -999,7 +1004,7 @@ def draw_ui(stdscr):
             if 0 <= SELECTED_ROW < len(conns):
                 meta = conns[SELECTED_ROW].get("metadata", {})
                 dip = meta.get("destinationIP") or meta.get("host")
-                open_abuse_modal(dip)
+                open_ipinfo_modal(dip, force=True)
 
         elif key in [ord("f"), ord("F")]:
             FILTER_QUERY = curses_prompt(stdscr, "")
@@ -1014,25 +1019,25 @@ def draw_ui(stdscr):
                         args=(f"connections/{conn_id}", "DELETE"),
                         daemon=True,
                     ).start()
-                    ABUSE_STATUS_MSG = f"Killed connection #{SELECTED_ROW + 1}"
+                    IPINFO_STATUS_MSG = f"Killed connection #{SELECTED_ROW + 1}"
         elif key in [ord("i"), ord("I")]:
             if 0 <= SELECTED_ROW < len(conns):
                 meta = conns[SELECTED_ROW].get("metadata", {})
                 target = meta.get("destinationIP") or meta.get("host")
-                query_abuseipdb_single(target, "Destination")
+                query_ipinfo_single(target, "Destination")
         elif key == ord("c"):
             if 0 <= SELECTED_ROW < len(conns):
                 meta = conns[SELECTED_ROW].get("metadata", {})
                 target = meta.get("destinationIP") or meta.get("host")
-                ABUSE_STATUS_MSG = f"Copied {target}" if copy_to_clipboard(target) else "Clipboard failed"
+                IPINFO_STATUS_MSG = f"Copied {target}" if copy_to_clipboard(target) else "Clipboard failed"
         elif key in [ord("d"), ord("D")]:
             if 0 <= SELECTED_ROW < len(conns):
                 meta = conns[SELECTED_ROW].get("metadata", {})
                 domain = meta.get("host")
                 if domain and domain != "-":
-                    ABUSE_STATUS_MSG = f"Copied domain {domain}" if copy_to_clipboard(domain) else "Clipboard failed"
+                    IPINFO_STATUS_MSG = f"Copied domain {domain}" if copy_to_clipboard(domain) else "Clipboard failed"
                 else:
-                    ABUSE_STATUS_MSG = "No domain to copy"
+                    IPINFO_STATUS_MSG = "No domain to copy"
 
         stdscr.erase()
         draw_main_interface(stdscr)
