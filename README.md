@@ -8,8 +8,8 @@ A TUI panel for [Sing-Box](https://github.com/SagerNet/sing-box)’s API calls u
 
   1. Visually pleasant minimal design.
   2. Highlights problematic connections.
-  3. AbuseIPDB API integration to instantly fetch and cache additional information about all outbound and inbound IP’s
-  4. A simple catching system for destination IP’s based on cached AbuseIPDB queries by country code.
+  3. ipinfo.io API integration to instantly fetch and cache additional information about all outbound and inbound IP’s
+  4. A simple catching system for destination IP’s based on cached ipinfo.io queries by country code.
 
 Seperate versions for sing-box running on a server (sing) or local client machine (singlo)
 
@@ -45,5 +45,5 @@ For clients sing-box API
 - <b>S</b>  Changes sort direction and sort order by most uploaded or downloaded.
 
 #### Information
-All settings, API address and keys can be set directly in the Python code.
+All settings, IP address and API keys can be set directly in the Python code.
 Uses Hack Nerd Font for icons.
