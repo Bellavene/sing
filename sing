@@ -18,30 +18,20 @@ os.environ["ESCDELAY"] = "25"
 try:
     import websocket
 except ImportError:
-    print("Missing required dependency: 'websocket-client'. Attempting automatic installation...")
-    try:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "websocket-client"])
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "cachetools"])
-        import websocket
-        print("Successfully installed 'websocket-client'. Starting script...")
-    except Exception as e:
-        print(f"Error: Failed to automatically install 'websocket-client' ({e}).")
-        print("Please install it manually using: pip install websocket-client")
-        sys.exit(1)
+    print("Error: 'websocket-client' module is required for Option B.")
+    print("Please install it using: pip install websocket-client")
+    sys.exit(1)
 
 # Global Config / Defaults
 SINGBOX_API = os.environ.get(
-    "SINGBOX_API",
-    "http://SINGBOX_ADDRESS:PORT")
+    "SINGBOX_API", "http://ADDRESS:PORT")
 SINGBOX_SECRET = os.environ.get(
-    "SINGBOX_SECRET",
-    "someSECRET")
-ABUSEIPDB_API_KEY = os.environ.get(
-    "ABUSEIPDB_API_KEY",
-    "someSECRET",
+    "SINGBOX_SECRET", "SECRET")
+IPINFO_API_KEY = os.environ.get(
+    "IPINFO_API_KEY", "",
 )
 CACHE_DIR = os.path.expanduser("~/.cache/sing-box-API")
-TAB_NAME = os.environ.get("SINGBOX_TAB_NAME", "<b>A1</b>")  # Terminal Tab / Window Name
+TAB_NAME = os.environ.get("SINGBOX_TAB_NAME", "Sing")  # Terminal Tab / Window Name
 CACHE_TTL_SECONDS = 14 * 86400  # 2 Weeks in seconds
 
 os.makedirs(CACHE_DIR, exist_ok=True)
@@ -61,14 +51,13 @@ CP_CLOSED = 9
 SORT_BY = "end"  # "start", "end", "upload", "download"
 FILTER_QUERY = ""
 GEO_COUNTRY_CODE = "RU"
-CHECK_GEO_IPS = True
+CHECK_GEO_IPS = True  # Controls live API fetches vs cache-only mode
 IS_PAUSED = False
-ABUSE_STATUS_MSG = ""
+IPINFO_STATUS_MSG = ""
 SELECTED_ROW = 0
 SELECTED_CONN_ID = None  # Unique connection tracker
 SCROLL_OFFSET = 0  # Offscreen scrolling line tracking
 AUTO_FOLLOW_MODE = "top"  # "top", "bottom", or "none"
-ABUSEIPDB_ENABLED = True  # Flag to enable/disable AbuseIPDB queries
 
 # GEO View State & Cache
 IN_GEO_VIEW = False
@@ -82,9 +71,9 @@ MODAL_LOCK = threading.Lock()
 MODAL_WIN = None
 
 # In-Memory Cache (Limited to 100 entries)
-ABUSE_CACHE = LRUCache(maxsize=100)
+IPINFO_CACHE = LRUCache(maxsize=100)
 
-# Thread Pool for AbuseIPDB fetches (max 5 workers)
+# Thread Pool for ipinfo.io fetches (max 5 workers)
 thread_pool = ThreadPoolExecutor(max_workers=5)
 
 CONNECTION_HISTORY = {}
@@ -151,12 +140,9 @@ def api_request(path, method="GET"):
         return None
     return None
 
-# --- Cache & AbuseIPDB Handling (14-Day Expiration) ---
-def fetch_abuse_data(target):
-    global ABUSEIPDB_ENABLED
-
-    if not ABUSEIPDB_ENABLED:
-        return {"ip": target or "-", "error": "AbuseIPDB Disabled"}
+# --- Cache & ipinfo.io Handling (14-Day Expiration) ---
+def fetch_ipinfo_data(target, force=False):
+    global CHECK_GEO_IPS
 
     if not target or target in ["-", "127.0.0.1", "::1"]:
         return {"ip": target or "-", "error": "Invalid / Local Target"}
@@ -174,11 +160,11 @@ def fetch_abuse_data(target):
     cache_file = os.path.join(CACHE_DIR, f"{cache_key}.json")
     now = time.time()
 
-    if cache_key in ABUSE_CACHE:
+    if cache_key in IPINFO_CACHE:
         if os.path.exists(cache_file):
             file_mtime = os.path.getmtime(cache_file)
             if now - file_mtime < CACHE_TTL_SECONDS:
-                return ABUSE_CACHE[cache_key]
+                return IPINFO_CACHE[cache_key]
 
     if os.path.exists(cache_file):
         try:
@@ -186,36 +172,34 @@ def fetch_abuse_data(target):
             if now - file_mtime < CACHE_TTL_SECONDS:
                 with open(cache_file, "r") as f:
                     data = json.load(f)
-                    ABUSE_CACHE[cache_key] = data
+                    IPINFO_CACHE[cache_key] = data
                     return data
         except Exception:
             pass
 
-    if not ABUSEIPDB_API_KEY:
-        return {"ip": cache_key, "error": "API Key Not Set"}
+    if not CHECK_GEO_IPS and not force:
+        return {"ip": cache_key, "error": "ipinfo.io Disabled (Cache Only)"}
 
     try:
         query_target = query_ip if is_valid_ip(query_ip) else cache_key
-        url = f"https://api.abuseipdb.com/api/v2/check?ipAddress={urllib.parse.quote(query_target)}"
-        req = urllib.request.Request(
-            url,
-            headers={"Key": ABUSEIPDB_API_KEY, "Accept": "application/json"},
-        )
+        url = f"https://ipinfo.io/{urllib.parse.quote(query_target)}/json"
+        headers = {"Accept": "application/json"}
+        if IPINFO_API_KEY:
+            headers["Authorization"] = f"Bearer {IPINFO_API_KEY}"
+
+        req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=2.5) as resp:
-            data = json.loads(resp.read().decode("utf-8")).get("data", {})
+            data = json.loads(resp.read().decode("utf-8"))
             res = {
-                "ip": query_ip if is_valid_ip(query_ip) else cache_key,
+                "ip": data.get("ip", query_ip if is_valid_ip(query_ip) else cache_key),
                 "host": query_host,
-                "score": str(data.get("abuseConfidenceScore", "0")),
-                "reports": str(data.get("totalReports", 0)),
-                "country": data.get("countryCode", "-"),
-                "domain": data.get("domain", "-"),
-                "isp": data.get("isp", "-"),
-                "usageType": data.get("usageType", "-"),
-                "whitelisted": data.get("isWhitelisted", False),
+                "country": data.get("country", "-"),
+                "domain": data.get("hostname", "-"),
+                "isp": data.get("org", "-"),
+                "usageType": data.get("company", {}).get("type", "-") if isinstance(data.get("company"), dict) else "-",
                 "error": None,
             }
-            ABUSE_CACHE[cache_key] = res
+            IPINFO_CACHE[cache_key] = res
             try:
                 with open(cache_file, "w") as f:
                     json.dump(res, f)
@@ -225,13 +209,13 @@ def fetch_abuse_data(target):
     except Exception as e:
         error_msg = str(e)
         if "HTTP Error 429" in error_msg:
-            ABUSEIPDB_ENABLED = False
-            return {"ip": cache_key, "error": "AbuseIPDB Disabled (Rate Limited)"}
+            CHECK_GEO_IPS = False
+            return {"ip": cache_key, "error": "ipinfo.io Disabled (Rate Limited)"}
         else:
             return {"ip": cache_key, "error": error_msg}
 
-def trigger_async_abuse_fetch(target):
-    if not ABUSEIPDB_ENABLED:
+def trigger_async_ipinfo_fetch(target):
+    if not CHECK_GEO_IPS:
         return
 
     if not target or target in ["-", "127.0.0.1", "::1"]:
@@ -246,63 +230,47 @@ def trigger_async_abuse_fetch(target):
 
     cache_file = os.path.join(CACHE_DIR, f"{cache_key}.json")
 
-    if cache_key in ABUSE_CACHE:
+    if cache_key in IPINFO_CACHE:
         if os.path.exists(cache_file):
             file_mtime = os.path.getmtime(cache_file)
             if time.time() - file_mtime < CACHE_TTL_SECONDS:
                 return
 
-    thread_pool.submit(fetch_abuse_data, cache_key)
+    thread_pool.submit(fetch_ipinfo_data, cache_key)
 
-def query_abuseipdb_single(target, target_label):
-    global ABUSE_STATUS_MSG, ABUSEIPDB_ENABLED
-    if not ABUSEIPDB_ENABLED:
-        ABUSE_STATUS_MSG = "AbuseIPDB Disabled"
-        return
-    if not ABUSEIPDB_API_KEY:
-        ABUSE_STATUS_MSG = "AbuseIPDB API Key Not Set"
-        return
+def query_ipinfo_single(target, target_label):
+    global IPINFO_STATUS_MSG
     if not target or target == "-":
-        ABUSE_STATUS_MSG = f"Invalid {target_label}"
+        IPINFO_STATUS_MSG = f"Invalid {target_label}"
         return
 
-    ABUSE_STATUS_MSG = f"Loading AbuseIPDB for {target_label} ({target})..."
+    IPINFO_STATUS_MSG = f"Loading ipinfo.io for {target_label} ({target})..."
 
     def worker():
-        global ABUSE_STATUS_MSG
-        data = fetch_abuse_data(target)
+        global IPINFO_STATUS_MSG
+        data = fetch_ipinfo_data(target, force=True)
         if data.get("error"):
-            ABUSE_STATUS_MSG = f"AbuseIPDB Error: {data['error']}"
+            IPINFO_STATUS_MSG = f"ipinfo.io Error: {data['error']}"
         else:
-            msg = f"{data.get('ip', target)}  {data.get('country', '-')}  {data.get('isp', '-')}  {data.get('domain', '-')}  {data.get('score', '0')}%  {data.get('reports', '0')}"
-            ABUSE_STATUS_MSG = msg
+            msg = f"{data.get('ip', target)}  {data.get('country', '-')}  {data.get('isp', '-')}  {data.get('domain', '-')}"
+            IPINFO_STATUS_MSG = msg
 
     thread_pool.submit(worker)
 
-def open_abuse_modal(sip, dip):
-    global MODAL_DATA, ABUSEIPDB_ENABLED
-
-    if not ABUSEIPDB_ENABLED:
-        with MODAL_LOCK:
-            MODAL_DATA = {
-                "sip": sip,
-                "dip": dip,
-                "s_data": {"ip": sip, "error": "AbuseIPDB Disabled"},
-                "d_data": {"ip": dip, "error": "AbuseIPDB Disabled"},
-            }
-        return
+def open_ipinfo_modal(sip, dip, force=False):
+    global MODAL_DATA
 
     cache_file_sip = os.path.join(CACHE_DIR, f"{sip}.json")
     cache_file_dip = os.path.join(CACHE_DIR, f"{dip}.json")
     now = time.time()
 
-    s_initial = ABUSE_CACHE.get(sip) if (
-        sip in ABUSE_CACHE
+    s_initial = IPINFO_CACHE.get(sip) if (
+        sip in IPINFO_CACHE
         and os.path.exists(cache_file_sip)
         and (now - os.path.getmtime(cache_file_sip) < CACHE_TTL_SECONDS)
     ) else {"ip": sip, "loading": True}
-    d_initial = ABUSE_CACHE.get(dip) if (
-        dip in ABUSE_CACHE
+    d_initial = IPINFO_CACHE.get(dip) if (
+        dip in IPINFO_CACHE
         and os.path.exists(cache_file_dip)
         and (now - os.path.getmtime(cache_file_dip) < CACHE_TTL_SECONDS)
     ) else {"ip": dip, "loading": True}
@@ -316,23 +284,23 @@ def open_abuse_modal(sip, dip):
         }
 
     def get_cached_or_none(key, cache_path):
-        if key in ABUSE_CACHE and os.path.exists(cache_path):
+        if key in IPINFO_CACHE and os.path.exists(cache_path):
             if now - os.path.getmtime(cache_path) < CACHE_TTL_SECONDS:
-                return ABUSE_CACHE[key]
+                return IPINFO_CACHE[key]
         if os.path.exists(cache_path):
             try:
                 if now - os.path.getmtime(cache_path) < CACHE_TTL_SECONDS:
                     with open(cache_path, "r") as f:
                         data = json.load(f)
-                        ABUSE_CACHE[key] = data
+                        IPINFO_CACHE[key] = data
                         return data
             except Exception:
                 pass
         return None
 
     def worker():
-        s_res = get_cached_or_none(sip, cache_file_sip) or fetch_abuse_data(sip)
-        d_res = get_cached_or_none(dip, cache_file_dip) or fetch_abuse_data(dip)
+        s_res = (not force and get_cached_or_none(sip, cache_file_sip)) or fetch_ipinfo_data(sip, force=force)
+        d_res = (not force and get_cached_or_none(dip, cache_file_dip)) or fetch_ipinfo_data(dip, force=force)
         with MODAL_LOCK:
             if MODAL_DATA:
                 MODAL_DATA["s_data"] = s_res
@@ -463,14 +431,14 @@ def process_connections_payload(raw_conns):
         meta = c.get("metadata", {})
         sip = meta.get("sourceIP")
         if sip:
-            trigger_async_abuse_fetch(sip)
+            trigger_async_ipinfo_fetch(sip)
         dip = str(meta.get("destinationIP") or "-")
         host = str(meta.get("host") or "-")
         target_key = dip if dip != "-" else host
         if target_key:
-            trigger_async_abuse_fetch(target_key)
-            ab_info = ABUSE_CACHE.get(target_key, {})
-            if isinstance(ab_info, dict) and ab_info.get("country") == GEO_COUNTRY_CODE:
+            trigger_async_ipinfo_fetch(target_key)
+            ip_info = IPINFO_CACHE.get(target_key, {})
+            if isinstance(ip_info, dict) and ip_info.get("country") == GEO_COUNTRY_CODE:
                 cid = c.get("id")
                 if cid:
                     GEO_CONNECTIONS_CACHE[cid] = c
@@ -621,13 +589,13 @@ def draw_modal_overlay(stdscr):
         MODAL_WIN.erase()
         MODAL_WIN.attron(curses.color_pair(CP_MAGENTA) | curses.A_BOLD)
         MODAL_WIN.box()
-        MODAL_WIN.addstr(0, 2, " AbuseIPDB Connection Details ", curses.color_pair(CP_MAGENTA) | curses.A_BOLD)
+        MODAL_WIN.addstr(0, 2, " ipinfo.io Connection Details ", curses.color_pair(CP_MAGENTA) | curses.A_BOLD)
         MODAL_WIN.attroff(curses.color_pair(CP_MAGENTA) | curses.A_BOLD)
 
         def draw_ip_block(y_offset, title, data):
-            MODAL_WIN.addstr(y_offset, 2, f"{title} {data.get('country', '-')} {data.get('ip', '-')} {data.get('score', '0')}%  {data.get('reports', 0)}", curses.color_pair(CP_YELLOW) | curses.A_BOLD)
+            MODAL_WIN.addstr(y_offset, 2, f"{title} {data.get('country', '-')} {data.get('ip', '-')}", curses.color_pair(CP_YELLOW) | curses.A_BOLD)
             if data.get("loading"):
-                MODAL_WIN.addstr(y_offset + 1, 4, "Fetching threat intelligence...", curses.A_BOLD)
+                MODAL_WIN.addstr(y_offset + 1, 4, "Fetching ipinfo.io intelligence...", curses.A_BOLD)
             elif data.get("error"):
                 MODAL_WIN.addstr(y_offset + 1, 4, f"Error: {data['error']}", curses.color_pair(CP_ERROR) | curses.A_BOLD)
             else:
@@ -704,37 +672,31 @@ def draw_main_interface(stdscr):
         host = str(meta.get("host") or "-")
         target_key = dip if dip != "-" else host
 
-        s_ab_info = ABUSE_CACHE.get(sip, {})
-        ab_info = ABUSE_CACHE.get(target_key, {})
-
-        raw_score = ab_info.get("score") if isinstance(ab_info, dict) else None
-        score_str = f"{raw_score}%" if raw_score is not None else "-"
-        reports_str = str(ab_info.get("reports", "-")) if isinstance(ab_info, dict) else "-"
+        s_ip_info = IPINFO_CACHE.get(sip, {})
+        ip_info = IPINFO_CACHE.get(target_key, {})
 
         table_data.append({
             "num": str(i + 1),
             "type": clean_type(meta.get("type")),
             "sip": sip,
-            "scc": s_ab_info.get("country", "-") if isinstance(s_ab_info, dict) else "-",
+            "scc": s_ip_info.get("country", "-") if isinstance(s_ip_info, dict) else "-",
             "count": str(c.get("count", "1")),
-            "cc": ab_info.get("country", "-") if isinstance(ab_info, dict) else "-",
+            "cc": ip_info.get("country", "-") if isinstance(ip_info, dict) else "-",
             "dip": dip,
             "host": host,
             "dport": str(meta.get("destinationPort") or "-"),
             "up": fmt_bytes(c.get("upload", 0)),
             "down": fmt_bytes(c.get("download", 0)),
-            "score": score_str,
-            "reports": reports_str,
             "time": parse_time(c.get("start")),
-            "isp": ab_info.get("isp", "-") if isinstance(ab_info, dict) else "-",
-            "usage": ab_info.get("usageType", "-") if isinstance(ab_info, dict) else "-",
+            "isp": ip_info.get("isp", "-") if isinstance(ip_info, dict) else "-",
+            "usage": ip_info.get("usageType", "-") if isinstance(ip_info, dict) else "-",
             "raw_up": c.get("upload", 0),
             "raw_down": c.get("download", 0),
             "raw_dip": target_key,
             "raw_is_closed": c.get("_is_closed", False),
         })
 
-    cols = ["type", "sip", "scc", "count", "cc", "dip", "host", "dport", "up", "down", "score", "reports", "time", "isp", "usage"]
+    cols = ["type", "sip", "scc", "count", "cc", "dip", "host", "dport", "up", "down", "time", "isp", "usage"]
     visible_rows = table_data[scroll_off : scroll_off + max_visible_rows]
 
     col_widths = {k: 0 for k in cols}
@@ -745,13 +707,13 @@ def draw_main_interface(stdscr):
     max_visible_count_len = max([len(r["count"]) for r in visible_rows], default=1)
     col_widths["count"] = max_visible_count_len
 
-    MAGENTA_COL_KEYS = {"count", "scc", "cc", "isp", "usage", "score", "reports"}
+    MAGENTA_COL_KEYS = {"count", "scc", "cc", "isp", "usage"}
     GREEN_COL_KEYS = {"dip", "host"}
 
     for screen_y, row in enumerate(visible_rows):
         actual_idx = scroll_off + screen_y
 
-        is_geo = ABUSE_CACHE.get(row["raw_dip"], {}).get("country") == GEO_COUNTRY_CODE
+        is_geo = IPINFO_CACHE.get(row["raw_dip"], {}).get("country") == GEO_COUNTRY_CODE
         is_dead = row["raw_up"] == 0 or row["raw_down"] == 0
         is_closed = row["raw_is_closed"]
 
@@ -776,8 +738,6 @@ def draw_main_interface(stdscr):
             ("dport", row["dport"].rjust(col_widths["dport"])),
             ("up", row["up"].rjust(col_widths["up"])),
             ("down", row["down"].rjust(col_widths["down"])),
-            ("score", row["score"].rjust(col_widths["score"])),
-            ("reports", row["reports"].rjust(col_widths["reports"])),
             ("time", row["time"].ljust(col_widths["time"])),
             ("isp", row["isp"].ljust(col_widths["isp"])),
             ("usage", row["usage"].ljust(col_widths["usage"])),
@@ -858,15 +818,15 @@ def draw_main_interface(stdscr):
             status_items.append((sort_icon, curses.color_pair(CP_MAGENTA) | curses.A_BOLD))
 
     if CHECK_GEO_IPS:
-        status_items.append(("󰰟", curses.color_pair(CP_MAGENTA) | curses.A_BOLD))
+        status_items.append(("󰰟 ", curses.color_pair(CP_MAGENTA) | curses.A_BOLD))
     if IN_GEO_VIEW:
         status_items.append(("", curses.color_pair(CP_MAGENTA) | curses.A_BOLD))
     geo_count = len(GEO_CONNECTIONS_CACHE)
 
     if FILTER_QUERY:
         status_items.append((f" {FILTER_QUERY}", curses.color_pair(CP_MAGENTA) | curses.A_BOLD))
-    if ABUSE_STATUS_MSG:
-        status_items.append((ABUSE_STATUS_MSG, curses.color_pair(CP_MAGENTA) | curses.A_BOLD))
+    if IPINFO_STATUS_MSG:
+        status_items.append((IPINFO_STATUS_MSG, curses.color_pair(CP_MAGENTA) | curses.A_BOLD))
 
     current_pos = (sel_row + 1) if conns else 0
     scroll_pct = f"{geo_count} {current_pos}/{len(conns)}"
@@ -905,7 +865,7 @@ def update_selection_id(conns):
             SELECTED_CONN_ID = conns[SELECTED_ROW].get("id")
 
 def draw_ui(stdscr):
-    global SORT_BY, FILTER_QUERY, CHECK_GEO_IPS, IS_PAUSED, ABUSE_STATUS_MSG
+    global SORT_BY, FILTER_QUERY, CHECK_GEO_IPS, IS_PAUSED, IPINFO_STATUS_MSG
     global SELECTED_ROW, SCROLL_OFFSET, MODAL_DATA, MODAL_WIN, AUTO_FOLLOW_MODE, SELECTED_CONN_ID
     global IN_GEO_VIEW, GEO_SELECTED_ROW, GEO_SCROLL_OFFSET, GEO_SELECTED_CONN_ID
 
@@ -1069,7 +1029,7 @@ def draw_ui(stdscr):
                 meta = conns[sel_idx].get("metadata", {})
                 sip = meta.get("sourceIP")
                 dip = meta.get("destinationIP") or meta.get("host")
-                open_abuse_modal(sip, dip)
+                open_ipinfo_modal(sip, dip, force=True)
 
         elif key in [ord("f"), ord("F")]:
             if not IN_GEO_VIEW:
@@ -1086,28 +1046,27 @@ def draw_ui(stdscr):
                         args=(f"connections/{conn_id}", "DELETE"),
                         daemon=True,
                     ).start()
-                    ABUSE_STATUS_MSG = f"Killed connection #{sel_idx + 1}"
+                    IPINFO_STATUS_MSG = f"Killed connection #{sel_idx + 1}"
         elif key == ord("c"):
             # Copy selected destinationIP
             sel_idx = GEO_SELECTED_ROW if IN_GEO_VIEW else SELECTED_ROW
             if 0 <= sel_idx < len(conns):
                 meta = conns[sel_idx].get("metadata", {})
                 target = meta.get("destinationIP") or meta.get("host") or "-"
-                label = "Dest IP"
-                ABUSE_STATUS_MSG = f"󰆏 {target}" if copy_to_clipboard(target) else "Clipboard failed"
+                IPINFO_STATUS_MSG = f"󰆏 {target}" if copy_to_clipboard(target) else "Clipboard failed"
         elif key == ord("C"):
             # Copy selected sourceIP (Shift+c)
             sel_idx = GEO_SELECTED_ROW if IN_GEO_VIEW else SELECTED_ROW
             if 0 <= sel_idx < len(conns):
                 sip = conns[sel_idx].get("metadata", {}).get("sourceIP")
-                ABUSE_STATUS_MSG = f"󰆏 {sip}" if copy_to_clipboard(sip) else "Clipboard failed"
+                IPINFO_STATUS_MSG = f"󰆏 {sip}" if copy_to_clipboard(sip) else "Clipboard failed"
         elif key == ord("d"):
             # Copy domain (host) from selected row
             sel_idx = GEO_SELECTED_ROW if IN_GEO_VIEW else SELECTED_ROW
             if 0 <= sel_idx < len(conns):
                 meta = conns[sel_idx].get("metadata", {})
                 host_val = meta.get("host") or "-"
-                ABUSE_STATUS_MSG = f"󰆏 {host_val}" if copy_to_clipboard(host_val) else "Clipboard failed"
+                IPINFO_STATUS_MSG = f"󰆏 {host_val}" if copy_to_clipboard(host_val) else "Clipboard failed"
 
         # Tab: add selected line to GEO view manually (formerly X behavior)
         elif key == ord('\t'):
